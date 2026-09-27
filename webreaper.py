@@ -454,59 +454,76 @@ def inject_url(url, param, value):
 # ══════════════════════════════════════════════════
 
 def crawl_site(start_url):
-    # *araignée patiente, elle tisse sa toile URL par URL*
-    queue    = Queue()
-    queue.put((start_url, 0))
-    visited  = set()
-    all_urls = []
-    all_forms = []
-    depth_limit = 4 if DEEP_MODE else 2
-    lock     = threading.Lock()
+    # *BFS par niveaux — elle tisse méthodiquement, jamais elle ne s'emballe*
+    visited     = set()
+    all_urls    = []
+    all_forms   = []
+    depth_limit = 4 if DEEP_MODE else 3
+    lock        = threading.Lock()
+    frontier    = [start_url]
 
-    def worker():
-        while True:
+    for depth in range(depth_limit + 1):
+        if not frontier or len(all_urls) >= MAX_URLS:
+            break
+
+        next_frontier = []
+        nf_lock       = threading.Lock()
+        sem           = threading.Semaphore(min(THREADS, 10))
+        threads       = []
+
+        def fetch_page(url):
             try:
-                url, depth = queue.get(timeout=2)
-            except Empty:
-                return
-
-            with lock:
                 norm = urllib.parse.urldefrag(url)[0]
-                if norm in visited or len(all_urls) >= MAX_URLS:
-                    queue.task_done()
-                    continue
-                visited.add(norm)
-                all_urls.append(url)
+                with lock:
+                    if norm in visited:
+                        return
+                    visited.add(norm)
 
-            progress(f"Crawling [{len(all_urls)}/{MAX_URLS}] {url[:80]}")
+                body, _, status, _, _ = fetch(url, timeout=10)
+                if not body or status in (404, 403):
+                    return
 
-            body, headers, status, _, _ = fetch(url, timeout=8)
-            if not body or status in (404, 403, 500):
-                queue.task_done()
-                continue
+                with lock:
+                    all_urls.append(url)
+                    progress(f"Crawling [{len(all_urls)}/{MAX_URLS}] d={depth} {url[:65]}")
 
-            parser = SiteParser(ORIGIN)
-            try:
-                parser.feed(body)
-            except Exception:
-                pass
+                parser = SiteParser(ORIGIN)
+                try:
+                    parser.feed(body)
+                except Exception:
+                    pass
 
-            with lock:
-                all_forms.extend(parser.forms)
+                with lock:
+                    all_forms.extend(parser.forms)
 
-            if depth < depth_limit:
-                for link in parser.links:
-                    norm_link = urllib.parse.urldefrag(link)[0]
-                    with lock:
-                        if norm_link not in visited:
-                            queue.put((link, depth + 1))
+                with nf_lock:
+                    for link in parser.links:
+                        lnorm = urllib.parse.urldefrag(link)[0]
+                        if lnorm not in visited:
+                            next_frontier.append(link)
+            finally:
+                sem.release()
 
-            queue.task_done()
+        for url in frontier:
+            if len(all_urls) >= MAX_URLS:
+                break
+            sem.acquire()
+            t = threading.Thread(target=fetch_page, args=(url,), daemon=True)
+            t.start()
+            threads.append(t)
 
-    workers = [threading.Thread(target=worker, daemon=True) for _ in range(min(THREADS, 8))]
-    for w in workers:
-        w.start()
-    queue.join()
+        for t in threads:
+            t.join()
+
+        # deduplicate next frontier preserving order
+        seen_nf = set()
+        deduped = []
+        for u in next_frontier:
+            n = urllib.parse.urldefrag(u)[0]
+            if n not in seen_nf and n not in visited:
+                seen_nf.add(n)
+                deduped.append(u)
+        frontier = deduped
 
     print()
     return all_urls, all_forms
