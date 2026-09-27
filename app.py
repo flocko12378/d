@@ -2,10 +2,10 @@
 """
 WebReaper Pro v5 — Flask + engine maison
 pip install requests beautifulsoup4 flask
-python app.py → http://localhost:5000
+python app.py
 """
 
-import threading, uuid, warnings
+import threading, uuid, warnings, json, os, tempfile
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
@@ -16,13 +16,37 @@ from flask import Flask, jsonify, render_template_string, request as freq
 warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
-SCANS = {}  # scan_id → {lines:[], done:bool}
+# Scan state stored in temp files — works across all threading/process configs
+# SCAN_DIR/<sid>.jsonl  → one JSON object per line (append-only)
+# SCAN_DIR/<sid>.done   → created when scan finishes
+SCAN_DIR = tempfile.mkdtemp(prefix="webreaper_")
+
+def _lines_path(sid): return os.path.join(SCAN_DIR, sid + ".jsonl")
+def _done_path(sid):  return os.path.join(SCAN_DIR, sid + ".done")
+
+def _write_line(sid, obj):
+    with open(_lines_path(sid), "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+def _read_lines(sid, offset=0):
+    path = _lines_path(sid)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        all_lines = [json.loads(l) for l in f if l.strip()]
+    return all_lines[offset:]
+
+def _is_done(sid):
+    return os.path.exists(_done_path(sid))
+
+def _mark_done(sid):
+    open(_done_path(sid), "w").close()
 
 # ══════════════════════════════════════════════════════════════
 #  SCANNER ENGINE
 # ══════════════════════════════════════════════════════════════
 
-SQLI_PAYLOADS = ["'", "''", "1 OR 1=1", "1' OR '1'='1", "1 AND SLEEP(0)--"]
+SQLI_PAYLOADS = ["'", "''", "1 OR 1=1", "1' OR '1'='1"]
 SQLI_ERRORS   = [
     "sql syntax","mysql_fetch","you have an error","unclosed quotation",
     "ora-","sqlite","postgresql","mssql","syntax error","invalid query",
@@ -30,12 +54,9 @@ SQLI_ERRORS   = [
 ]
 XSS_PAYLOAD   = "<wr3aper>"
 SSTI_PAYLOADS = ["{{7*7}}", "${7*7}", "<%=7*7%>"]
-LFI_PAYLOADS  = [
-    "../../../../etc/passwd",
-    "....//....//....//etc/passwd",
-    "../../../../windows/win.ini",
-]
-CMD_PAYLOADS  = [";id", "|id", "&&id", ";whoami", "`id`", "$(id)"]
+LFI_PAYLOADS  = ["../../../../etc/passwd", "....//....//....//etc/passwd",
+                  "../../../../windows/win.ini"]
+CMD_PAYLOADS  = [";id", "|id", "&&id", ";whoami"]
 CMD_INDICATORS = ["uid=", "www-data", "root", "nobody", "[extensions]"]
 REDIRECT_PAYLOADS = ["https://evil.com", "//evil.com"]
 SENSITIVE_PATHS = [
@@ -43,8 +64,7 @@ SENSITIVE_PATHS = [
     ".git/HEAD",".svn/entries","phpinfo.php","info.php","test.php",
     "admin/","wp-admin/","administrator/","backup.zip","backup.tar.gz",
     "robots.txt","sitemap.xml","server-status","server-info","web.config",
-    "package.json","Dockerfile",".DS_Store",
-    "api/v1/users","api/users","graphql","swagger.json","openapi.json",
+    "package.json","Dockerfile","swagger.json","openapi.json",
 ]
 SECURITY_HEADERS = [
     ("strict-transport-security", "MEDIUM", "Missing HSTS header"),
@@ -62,12 +82,11 @@ def make_session():
     s = requests.Session()
     s.headers["User-Agent"] = UA
     s.verify = False
-    s.timeout = 10
+    s.timeout = 12
     return s
 
 
 def inject_param(url, key, value):
-    """Replace one query param value in url."""
     p  = urlparse(url)
     qs = parse_qs(p.query, keep_blank_values=True)
     qs[key] = [value]
@@ -95,7 +114,6 @@ def crawl(sess, base, deep=False):
     base_host = urlparse(base).netloc
     limit     = 60 if deep else 25
     visited, queue, pages = set(), [base], []
-
     while queue and len(visited) < limit:
         url = queue.pop(0)
         if url in visited:
@@ -138,8 +156,6 @@ def get_forms(url, html):
     return out
 
 
-# ── sqli ──────────────────────────────────────────────────────
-
 def has_sqli_error(text):
     low = text.lower()
     return any(e in low for e in SQLI_ERRORS)
@@ -148,8 +164,7 @@ def has_sqli_error(text):
 def test_sqli_url(sess, url, params, emit):
     for pname in params:
         for payload in SQLI_PAYLOADS:
-            injected = inject_param(url, pname, payload)
-            r = safe_get(sess, injected)
+            r = safe_get(sess, inject_param(url, pname, payload))
             if r and has_sqli_error(r.text):
                 emit("HIGH", f"SQLi (error-based) → {url}", f"param={pname!r} payload={payload!r}")
                 return
@@ -158,22 +173,17 @@ def test_sqli_url(sess, url, params, emit):
 def test_sqli_form(sess, form, emit):
     for pname in form["inputs"]:
         for payload in SQLI_PAYLOADS:
-            d = dict(form["inputs"])
-            d[pname] = payload
-            r = (safe_post(sess, form["action"], d)
-                 if form["method"] == "post"
+            d = dict(form["inputs"]); d[pname] = payload
+            r = (safe_post(sess, form["action"], d) if form["method"] == "post"
                  else safe_get(sess, form["action"], params=d))
             if r and has_sqli_error(r.text):
-                emit("HIGH", f"SQLi (form) → {form['action']}", f"param={pname!r} payload={payload!r}")
+                emit("HIGH", f"SQLi (form) → {form['action']}", f"param={pname!r}")
                 return
 
 
-# ── xss ───────────────────────────────────────────────────────
-
 def test_xss_url(sess, url, params, emit):
     for pname in params:
-        injected = inject_param(url, pname, XSS_PAYLOAD)
-        r = safe_get(sess, injected)
+        r = safe_get(sess, inject_param(url, pname, XSS_PAYLOAD))
         if r and XSS_PAYLOAD in r.text:
             emit("HIGH", f"XSS (reflected) → {url}", f"param={pname!r}")
             return
@@ -181,67 +191,51 @@ def test_xss_url(sess, url, params, emit):
 
 def test_xss_form(sess, form, emit):
     for pname in form["inputs"]:
-        d = dict(form["inputs"])
-        d[pname] = XSS_PAYLOAD
-        r = (safe_post(sess, form["action"], d)
-             if form["method"] == "post"
+        d = dict(form["inputs"]); d[pname] = XSS_PAYLOAD
+        r = (safe_post(sess, form["action"], d) if form["method"] == "post"
              else safe_get(sess, form["action"], params=d))
         if r and XSS_PAYLOAD in r.text:
             emit("HIGH", f"XSS (form) → {form['action']}", f"param={pname!r}")
             return
 
 
-# ── ssti ──────────────────────────────────────────────────────
-
 def test_ssti_url(sess, url, params, emit):
     for pname in params:
         for payload in SSTI_PAYLOADS:
-            injected = inject_param(url, pname, payload)
-            r = safe_get(sess, injected)
+            r = safe_get(sess, inject_param(url, pname, payload))
             if r and "49" in r.text:
                 emit("CRITICAL", f"SSTI → {url}", f"param={pname!r} payload={payload!r}")
                 return
 
 
-# ── lfi ───────────────────────────────────────────────────────
-
 def test_lfi_url(sess, url, params, emit):
     for pname in params:
         for payload in LFI_PAYLOADS:
-            injected = inject_param(url, pname, payload)
-            r = safe_get(sess, injected)
+            r = safe_get(sess, inject_param(url, pname, payload))
             if r and ("root:x:0:" in r.text or "[extensions]" in r.text.lower()):
                 emit("CRITICAL", f"LFI → {url}", f"param={pname!r}")
                 return
 
 
-# ── cmd injection ─────────────────────────────────────────────
-
 def test_cmdi_url(sess, url, params, emit):
     for pname in params:
         for payload in CMD_PAYLOADS:
-            injected = inject_param(url, pname, payload)
-            r = safe_get(sess, injected)
+            r = safe_get(sess, inject_param(url, pname, payload))
             if r and any(ind in r.text for ind in CMD_INDICATORS):
-                emit("CRITICAL", f"Command Injection → {url}", f"param={pname!r} payload={payload!r}")
+                emit("CRITICAL", f"CMDi → {url}", f"param={pname!r} payload={payload!r}")
                 return
 
-
-# ── open redirect ─────────────────────────────────────────────
 
 def test_redirect_url(sess, url, params, emit):
     for pname in params:
         for payload in REDIRECT_PAYLOADS:
-            injected = inject_param(url, pname, payload)
-            r = safe_get(sess, injected)
+            r = safe_get(sess, inject_param(url, pname, payload))
             if r and r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
                 if "evil.com" in loc:
                     emit("MEDIUM", f"Open Redirect → {url}", f"param={pname!r} → {loc}")
                     return
 
-
-# ── security headers ──────────────────────────────────────────
 
 def test_headers(sess, base, emit):
     r = safe_get(sess, base)
@@ -251,13 +245,11 @@ def test_headers(sess, base, emit):
     for key, sev, msg in SECURITY_HEADERS:
         if key not in h:
             emit(sev, msg, base)
-    if "server" in h and h["server"]:
+    if h.get("server"):
         emit("LOW", f"Server banner: {h['server']}", base)
     if "x-powered-by" in h:
         emit("LOW", f"X-Powered-By: {h['x-powered-by']}", base)
 
-
-# ── cors ──────────────────────────────────────────────────────
 
 def test_cors(sess, base, emit):
     for origin in CORS_ORIGINS:
@@ -268,11 +260,9 @@ def test_cors(sess, base, emit):
         acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
         if acao in (origin, "*"):
             sev = "HIGH" if acac == "true" else "MEDIUM"
-            emit(sev, "CORS misconfiguration", f"Origin={origin!r} → {acao!r} credentials={acac!r}")
+            emit(sev, "CORS misconfiguration", f"Origin={origin!r} allowed")
             return
 
-
-# ── sensitive files ───────────────────────────────────────────
 
 def test_sensitive(sess, base, emit):
     base = base.rstrip("/")
@@ -283,7 +273,7 @@ def test_sensitive(sess, base, emit):
             continue
         if r.status_code == 200:
             sev = ("CRITICAL" if any(x in path for x in
-                   [".env", "config", "phpinfo", "database", "settings"])
+                   [".env","config","phpinfo","database","settings"])
                    else "HIGH")
             emit(sev, f"Sensitive file exposed ({path})", url)
         elif r.status_code == 403:
@@ -295,17 +285,17 @@ def test_sensitive(sess, base, emit):
 # ══════════════════════════════════════════════════════════════
 
 def scan_worker(sid, target, deep, brute):
-    state = SCANS[sid]
 
     def emit(level, msg, detail=""):
-        state["lines"].append({
+        _write_line(sid, {
             "type": "finding", "level": level,
             "msg": msg, "detail": detail,
             "ts": datetime.now().strftime("%H:%M:%S"),
         })
 
     def log(msg):
-        state["lines"].append({
+        print(f"[{sid[:8]}] {msg}", flush=True)  # visible in CMD terminal
+        _write_line(sid, {
             "type": "log", "msg": msg,
             "ts": datetime.now().strftime("%H:%M:%S"),
         })
@@ -318,7 +308,7 @@ def scan_worker(sid, target, deep, brute):
         test_headers(sess, target, emit)
         test_cors(sess, target, emit)
 
-        log("Phase 2 — Sensitive files discovery")
+        log("Phase 2 — Sensitive files")
         test_sensitive(sess, target, emit)
 
         log(f"Phase 3 — Crawling ({'deep' if deep else 'standard'})")
@@ -330,7 +320,6 @@ def scan_worker(sid, target, deep, brute):
             parsed = urlparse(url)
             qs     = parse_qs(parsed.query, keep_blank_values=True)
             params = {k: v[0] for k, v in qs.items()}
-
             if params:
                 test_sqli_url(sess, url, params, emit)
                 test_xss_url(sess, url, params, emit)
@@ -338,15 +327,14 @@ def scan_worker(sid, target, deep, brute):
                 test_ssti_url(sess, url, params, emit)
                 test_cmdi_url(sess, url, params, emit)
                 test_redirect_url(sess, url, params, emit)
-
             for form in get_forms(url, resp.text):
                 test_sqli_form(sess, form, emit)
                 test_xss_form(sess, form, emit)
 
         if brute:
             log("Phase 5 — Brute force logins")
-            USERS  = ["admin","root","user","administrator","test","guest"]
-            PASSES = ["admin","password","123456","root","admin123","pass","1234","letmein"]
+            USERS  = ["admin","root","user","administrator","test"]
+            PASSES = ["admin","password","123456","root","admin123","pass"]
             for url, resp in pages:
                 for form in get_forms(url, resp.text):
                     pw_f  = [n for n in form["inputs"] if "pass" in n.lower() or "pwd" in n.lower()]
@@ -356,12 +344,10 @@ def scan_worker(sid, target, deep, brute):
                     uf, pf = usr_f[0], pw_f[0]
                     found = False
                     for u in USERS:
-                        if found:
-                            break
+                        if found: break
                         for p in PASSES:
                             d = dict(form["inputs"]); d[uf] = u; d[pf] = p
-                            r = (safe_post(sess, form["action"], d)
-                                 if form["method"] == "post"
+                            r = (safe_post(sess, form["action"], d) if form["method"] == "post"
                                  else safe_get(sess, form["action"], params=d))
                             if r and r.status_code == 200 and any(
                                 x in r.text.lower()
@@ -371,17 +357,15 @@ def scan_worker(sid, target, deep, brute):
                                      f"{uf}={u!r}  {pf}={p!r}")
                                 found = True; break
 
-        total = sum(1 for l in state["lines"] if l.get("type") == "finding")
-        log(f"Done — {total} findings across {len(pages)} pages")
+        total = sum(1 for l in _read_lines(sid) if l.get("type") == "finding")
+        log(f"Done — {total} findings, {len(pages)} pages scanned")
 
     except Exception as e:
-        state["lines"].append({
-            "type": "log",
-            "msg": f"[!] Scan error: {e}",
-            "ts": datetime.now().strftime("%H:%M:%S"),
-        })
+        print(f"[{sid[:8]}] CRASH: {e}", flush=True)
+        _write_line(sid, {"type": "log", "msg": f"[!] Error: {e}",
+                           "ts": datetime.now().strftime("%H:%M:%S")})
 
-    state["done"] = True
+    _mark_done(sid)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -403,7 +387,7 @@ HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--txt);font-family:'Courier New',monospace;min-height:100vh}
-header{background:var(--bg2);border-bottom:1px solid var(--brd);padding:14px 26px;display:flex;align-items:center}
+header{background:var(--bg2);border-bottom:1px solid var(--brd);padding:14px 26px}
 .logo{font-size:18px;font-weight:700;color:var(--acc);letter-spacing:3px}
 .logo span{color:#333}
 .sub{color:var(--dim);font-size:10px;margin-top:2px}
@@ -454,7 +438,7 @@ button:disabled{background:#1a1a1a;color:#333;cursor:default}
 .ec{flex:1;min-width:0}
 .ec .msg{color:var(--txt);word-break:break-all}
 .ec .det{color:var(--dim);font-size:10.5px;margin-top:1px;padding-left:6px;border-left:2px solid var(--brd);word-break:break-all}
-.elog{color:#2f2f2f;font-size:10.5px;padding:0 0 0 126px;word-break:break-all}
+.elog{color:#3a3a3a;font-size:10.5px;padding:0 0 0 126px;word-break:break-all}
 .edone{color:var(--info);padding:8px 0 0;border-top:1px solid var(--brd);margin-top:4px;font-size:11px}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:240px;color:#222;gap:8px;font-size:12px}
 .empty .icon{font-size:40px;opacity:.15}
@@ -507,15 +491,33 @@ button:disabled{background:#1a1a1a;color:#333;cursor:default}
 <script>
 let timer=null,sid=null,offset=0,filter='ALL';
 let entries=[],counts={CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
-function filt(f,btn){filter=f;document.querySelectorAll('.fb').forEach(b=>b.classList.remove('on'));btn.classList.add('on');render();}
+
+function filt(f,btn){
+  filter=f;
+  document.querySelectorAll('.fb').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  render();
+}
+
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
 function render(){
-  const el=document.getElementById('log');let html='';
+  const el=document.getElementById('log');
+  let html='';
   for(const e of entries){
-    if(e.type==='log'){if(filter!=='ALL'&&filter!=='LOG')continue;html+=`<div class="elog">${esc(e.msg)}</div>`;}
-    else if(e.type==='finding'){
+    if(e.type==='log'){
+      if(filter!=='ALL'&&filter!=='LOG')continue;
+      html+=`<div class="elog">${esc(e.msg)}</div>`;
+    }else if(e.type==='finding'){
       if(filter!=='ALL'&&filter!==e.level)continue;
-      html+=`<div class="e"><span class="ets">${e.ts||''}</span><span class="badge ${e.level}">${e.level}</span><span class="ec"><div class="msg">${esc(e.msg)}</div>${e.detail?`<div class="det">${esc(e.detail)}</div>`:''}</span></div>`;
+      html+=`<div class="e">
+        <span class="ets">${e.ts||''}</span>
+        <span class="badge ${e.level}">${e.level}</span>
+        <span class="ec">
+          <div class="msg">${esc(e.msg)}</div>
+          ${e.detail?`<div class="det">${esc(e.detail)}</div>`:''}
+        </span>
+      </div>`;
     }
   }
   el.innerHTML=html||'<div class="empty"><div class="icon">⚡</div><div>No entries match filter</div></div>';
@@ -523,10 +525,13 @@ function render(){
   const f=entries.filter(e=>e.type==='finding').length;
   document.getElementById('cnt').textContent=f+' finding'+(f!==1?'s':'');
 }
+
 async function startScan(){
-  const target=document.getElementById('target').value.trim();if(!target)return;
-  stopScan();entries=[];
-  Object.keys(counts).forEach(k=>{counts[k]=0;});
+  const target=document.getElementById('target').value.trim();
+  if(!target)return;
+  stopScan();
+  entries=[];
+  Object.keys(counts).forEach(k=>counts[k]=0);
   ['nc','nh','nm','nl','ni'].forEach(id=>document.getElementById(id).textContent='0');
   render();
   document.getElementById('go').disabled=true;
@@ -536,12 +541,18 @@ async function startScan(){
   const deep=document.getElementById('deep').checked;
   const brute=document.getElementById('brute').checked;
   try{
-    const r=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,deep,brute})});
+    const r=await fetch('/start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({target,deep,brute})
+    });
     const d=await r.json();
     if(d.error){entries.push({type:'log',msg:'Error: '+d.error,ts:''});render();doneScan();return;}
-    sid=d.scan_id;offset=0;timer=setInterval(poll,900);
+    sid=d.scan_id; offset=0;
+    timer=setInterval(poll,1000);
   }catch(e){entries.push({type:'log',msg:'Fetch error: '+e,ts:''});render();doneScan();}
 }
+
 async function poll(){
   if(!sid)return;
   try{
@@ -556,12 +567,12 @@ async function poll(){
       }
     }
     offset+=d.items.length;
-    const p=Math.min(5+(offset*1.5),95);
-    document.getElementById('bar').style.width=p+'%';
+    document.getElementById('bar').style.width=Math.min(5+offset*1.5,95)+'%';
     render();
     if(d.done){document.getElementById('bar').style.width='100%';doneScan();}
-  }catch(e){}
+  }catch(e){console.error('poll error:',e);}
 }
+
 function doneScan(){if(timer){clearInterval(timer);timer=null;}sid=null;document.getElementById('go').disabled=false;document.getElementById('stop').style.display='none';}
 function stopScan(){if(sid)fetch('/stop/'+sid,{method:'POST'}).catch(()=>{});doneScan();}
 document.getElementById('target').addEventListener('keydown',e=>{if(e.key==='Enter')startScan();});
@@ -588,24 +599,23 @@ def start():
     if not target.startswith(("http://", "https://")):
         target = "http://" + target
     sid = str(uuid.uuid4())
-    SCANS[sid] = {"lines": [], "done": False}
+    print(f"[START] sid={sid[:8]} target={target}", flush=True)
     threading.Thread(target=scan_worker, args=(sid, target, deep, brute), daemon=True).start()
     return jsonify({"scan_id": sid})
 
 @app.route("/poll/<sid>")
 def poll(sid):
-    if sid not in SCANS:
-        return jsonify({"items": [], "done": True})
-    state  = SCANS[sid]
-    offset = int(freq.args.get("offset", 0))
-    return jsonify({"items": state["lines"][offset:], "done": state["done"]})
+    lines = _read_lines(sid, int(freq.args.get("offset", 0)))
+    done  = _is_done(sid)
+    return jsonify({"items": lines, "done": done})
 
 @app.route("/stop/<sid>", methods=["POST"])
 def stop_scan(sid):
-    if sid in SCANS:
-        SCANS[sid]["done"] = True
+    _mark_done(sid)
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    print("\n  WebReaper Pro v5 → http://localhost:5000\n")
-    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
+    print(f"\n  WebReaper Pro v5")
+    print(f"  Temp dir: {SCAN_DIR}")
+    print(f"  http://localhost:5000\n")
+    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
