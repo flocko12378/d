@@ -6,7 +6,7 @@ python app.py  →  http://localhost:5000
 """
 
 from flask import Flask, render_template_string, request, Response, jsonify
-import threading, queue, json, time, re, sys
+import threading, queue, json, time, re, sys, uuid
 from urllib.parse import urlparse, urljoin, urlencode, urldefrag, parse_qsl, urlunparse
 from collections import deque
 from datetime import datetime
@@ -20,6 +20,9 @@ except ImportError:
     sys.exit(1)
 
 app = Flask(__name__)
+
+# scan_id → {"queue": Queue, "done": bool}
+SCANS = {}
 
 # ══════════════════════════════════════════════════
 # PAYLOADS
@@ -675,7 +678,9 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-let es = null;
+let pollTimer = null;
+let scanId    = null;
+let offset    = 0;
 let allEntries = [];
 let currentFilter = 'ALL';
 const counts = {CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0, INFO:0};
@@ -689,17 +694,14 @@ function setFilter(f) {
 
 function renderEntries() {
   const log = document.getElementById('log');
-  const visible = currentFilter === 'ALL'
-    ? allEntries
-    : allEntries.filter(e => e.level === currentFilter || e.type);
-  if (visible.length === 0) {
-    log.innerHTML = '<div class="empty-state"><div class="icon">🕷</div><div>No entries yet</div></div>';
+  if (allEntries.length === 0) {
+    log.innerHTML = '<div class="empty-state"><div class="icon">🕷</div><div>Enter a URL and click SCAN</div></div>';
     return;
   }
-  log.innerHTML = visible.map(e => {
-    if (e.type === 'phase') return `<div class="phase-entry">── ${e.msg}</div>`;
-    if (e.type === 'crawl') return `<div class="crawl-entry">${e.msg}</div>`;
-    if (e.type === 'done')  return `<div class="done-entry">✓ ${e.msg}</div>`;
+  const html = allEntries.map(e => {
+    if (e.type === 'phase') return `<div class="phase-entry">── ${esc(e.msg)}</div>`;
+    if (e.type === 'crawl') return `<div class="crawl-entry">${esc(e.msg)}</div>`;
+    if (e.type === 'done')  return `<div class="done-entry">✓ ${esc(e.msg)}</div>`;
     if (currentFilter !== 'ALL' && e.level !== currentFilter) return '';
     return `<div class="entry">
       <span class="ts">${e.ts||''}</span>
@@ -710,19 +712,20 @@ function renderEntries() {
       </span>
     </div>`;
   }).join('');
+  log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
   document.getElementById('entry-count').textContent =
-    `${allEntries.filter(e=>e.level).length} findings`;
+    allEntries.filter(e => e.level).length + ' findings';
 }
 
 function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function startScan() {
+async function startScan() {
   const target = document.getElementById('target').value.trim();
   if (!target) return;
-  if (es) es.close();
+  stopScan();
 
   allEntries = [];
   Object.keys(counts).forEach(k => { counts[k]=0; document.getElementById('c-'+k.toLowerCase()).textContent='0'; });
@@ -734,46 +737,65 @@ function startScan() {
 
   const deep  = document.getElementById('deep').checked;
   const brute = document.getElementById('brute').checked;
-  const url   = `/scan?target=${encodeURIComponent(target)}&deep=${deep}&brute=${brute}`;
 
-  es = new EventSource(url);
-  let prog = 5;
+  try {
+    const res = await fetch('/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({target, deep, brute})
+    });
+    const data = await res.json();
+    scanId = data.scan_id;
+    offset = 0;
+    pollTimer = setInterval(poll, 800);
+  } catch(e) {
+    allEntries.push({type:'done', msg:'Failed to start: '+e});
+    renderEntries();
+    document.getElementById('scan-btn').disabled = false;
+    document.getElementById('stop-btn').style.display = 'none';
+  }
+}
 
-  es.onmessage = (e) => {
-    const data = JSON.parse(e.data);
-    allEntries.push(data);
+async function poll() {
+  if (!scanId) return;
+  try {
+    const res  = await fetch(`/poll/${scanId}?offset=${offset}`);
+    const data = await res.json();
 
-    if (data.level && counts[data.level] !== undefined) {
-      counts[data.level]++;
-      document.getElementById('c-' + data.level.toLowerCase()).textContent = counts[data.level];
+    for (const item of data.items) {
+      allEntries.push(item);
+      if (item.level && counts[item.level] !== undefined) {
+        counts[item.level]++;
+        document.getElementById('c-'+item.level.toLowerCase()).textContent = counts[item.level];
+      }
     }
+    offset += data.items.length;
 
-    prog = Math.min(prog + (data.type === 'crawl' ? 0.3 : data.type === 'phase' ? 3 : 1), 95);
+    const prog = Math.min(5 + allEntries.length * 0.5, 95);
     document.getElementById('progress-bar').style.width = prog + '%';
 
-    if (data.type === 'done') {
+    renderEntries();
+
+    if (data.done) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      scanId    = null;
       document.getElementById('progress-bar').style.width = '100%';
       document.getElementById('scan-btn').disabled = false;
       document.getElementById('stop-btn').style.display = 'none';
-      es.close();
     }
-
-    renderEntries();
-  };
-
-  es.onerror = () => {
-    document.getElementById('scan-btn').disabled = false;
-    document.getElementById('stop-btn').style.display = 'none';
-    es.close();
-  };
+  } catch(e) { /* network hiccup, retry next tick */ }
 }
 
 function stopScan() {
-  if (es) es.close();
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  scanId = null;
   document.getElementById('scan-btn').disabled = false;
   document.getElementById('stop-btn').style.display = 'none';
-  allEntries.push({type:'done', msg:'Scan stopped by user'});
-  renderEntries();
+  if (allEntries.length > 0) {
+    allEntries.push({type:'done', msg:'Scan stopped by user'});
+    renderEntries();
+  }
 }
 
 document.getElementById('target').addEventListener('keydown', e => {
@@ -787,38 +809,57 @@ document.getElementById('target').addEventListener('keydown', e => {
 def index():
     return render_template_string(HTML)
 
-@app.route("/scan")
-def scan_stream():
-    target = request.args.get("target","").strip()
-    deep   = request.args.get("deep","false").lower() == "true"
-    brute  = request.args.get("brute","false").lower() == "true"
+@app.route("/start", methods=["POST"])
+def start_scan():
+    data   = request.get_json(force=True)
+    target = data.get("target","").strip()
+    deep   = bool(data.get("deep", False))
+    brute  = bool(data.get("brute", False))
 
     if not target.startswith(("http://","https://")):
         target = "http://" + target
 
-    q = queue.Queue()
+    sid = str(uuid.uuid4())
+    q   = queue.Queue()
+    SCANS[sid] = {"queue": q, "done": False, "buf": []}
 
     def run():
         try:
             scan(target, deep, brute, lambda x: q.put(x))
         except Exception as e:
-            q.put({"type":"done","msg":f"Error: {e}"})
+            q.put({"type":"done","msg":f"Error: {str(e)}"})
 
     threading.Thread(target=run, daemon=True).start()
 
-    def generate():
+    # drain queue into buf in background
+    def drainer():
         while True:
             try:
-                item = q.get(timeout=60)
-                yield f"data: {json.dumps(item)}\n\n"
+                item = q.get(timeout=90)
+                SCANS[sid]["buf"].append(item)
                 if item.get("type") == "done":
+                    SCANS[sid]["done"] = True
                     break
             except queue.Empty:
-                yield "data: {\"type\":\"done\",\"msg\":\"Timeout\"}\n\n"
+                SCANS[sid]["buf"].append({"type":"done","msg":"Timeout"})
+                SCANS[sid]["done"] = True
                 break
 
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    threading.Thread(target=drainer, daemon=True).start()
+    return jsonify({"scan_id": sid})
+
+@app.route("/poll/<sid>")
+def poll(sid):
+    if sid not in SCANS:
+        return jsonify({"items":[],"done":True})
+    entry  = SCANS[sid]
+    offset = int(request.args.get("offset", 0))
+    items  = entry["buf"][offset:]
+    done   = entry["done"]
+    # cleanup after done + all items fetched
+    if done and offset + len(items) >= len(entry["buf"]):
+        SCANS.pop(sid, None)
+    return jsonify({"items": items, "done": done})
 
 if __name__ == "__main__":
     print("""
