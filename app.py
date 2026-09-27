@@ -558,6 +558,7 @@ async function poll(){
   try{
     const r=await fetch('/poll/'+sid+'?offset='+offset);
     const d=await r.json();
+    console.log('[poll]',JSON.stringify(d).slice(0,200));
     for(const item of d.items){
       entries.push(item);
       if(item.type==='finding'&&counts[item.level]!==undefined){
@@ -569,7 +570,7 @@ async function poll(){
     offset+=d.items.length;
     document.getElementById('bar').style.width=Math.min(5+offset*1.5,95)+'%';
     render();
-    if(d.done){document.getElementById('bar').style.width='100%';doneScan();}
+    if(d.done){console.log('[done] total items='+offset);document.getElementById('bar').style.width='100%';doneScan();}
   }catch(e){console.error('poll error:',e);}
 }
 
