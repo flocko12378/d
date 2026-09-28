@@ -17,19 +17,34 @@ from bs4 import BeautifulSoup
 import requests, urllib3
 urllib3.disable_warnings()
 
+def _detect_tor_port():
+    """Tor Browser = 9150, Tor daemon = 9050."""
+    import socket
+    for port in (9150, 9050):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=2)
+            s.close()
+            return port
+        except Exception:
+            pass
+    return None
+
 try:
     import cloudscraper
     def make_sess(tor=False):
         s = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows"})
         if tor:
-            s.proxies = {"http":"socks5h://127.0.0.1:9050","https":"socks5h://127.0.0.1:9050"}
+            port = _detect_tor_port() or 9150
+            s.proxies = {"http":f"socks5h://127.0.0.1:{port}","https":f"socks5h://127.0.0.1:{port}"}
+            print(f"  [Tor] SOCKS5 → 127.0.0.1:{port}")
         s.headers.update({"Accept-Language":"fr-FR,fr;q=0.9","Referer":"https://www.ugc.fr/"})
         return s
 except ImportError:
     def make_sess(tor=False):
         s = requests.Session(); s.verify = False
         if tor:
-            s.proxies = {"http":"socks5h://127.0.0.1:9050","https":"socks5h://127.0.0.1:9050"}
+            port = _detect_tor_port() or 9150
+            s.proxies = {"http":f"socks5h://127.0.0.1:{port}","https":f"socks5h://127.0.0.1:{port}"}
         s.headers.update({
             "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
             "Accept-Language":"fr-FR,fr;q=0.9","Referer":"https://www.ugc.fr/"
