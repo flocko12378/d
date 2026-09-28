@@ -19,6 +19,7 @@ Commands (in any channel the bot can read):
 import discord, sqlite3, os, json, socket, hashlib, re, requests
 from pathlib import Path
 from datetime import datetime
+from bs4 import BeautifulSoup
 import dns.resolver
 import warnings
 warnings.filterwarnings("ignore")
@@ -140,6 +141,88 @@ def shodan_internetdb(ip: str):
         return r.json()
     return {}
 
+def check_ugc_reservation(reservation_number: str) -> dict:
+    """
+    Vérifie si une réservation UGC est valide en tapant sur le portail web.
+    Retourne un dict: {valid, film, date, cinema, seats, raw_status}
+    """
+    reservation_number = reservation_number.strip().upper()
+    result = {"valid": None, "film": None, "date": None, "cinema": None, "seats": None, "raw": ""}
+
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Referer":         "https://www.ugc.fr/",
+    })
+    sess.verify = False
+
+    ERROR_KW  = ["introuvable","invalid","not found","aucune","incorrect","erreur"]
+    SUCCESS_KW = ["séance","cinema","film","salle","places","montant","votre réservation","reservation"]
+
+    try:
+        # seed session cookies
+        sess.get("https://www.ugc.fr/reservation/retrieveBooking.html", timeout=10)
+        # POST form
+        r = sess.post(
+            "https://www.ugc.fr/reservation/retrieveBooking.html",
+            data={"bookingNumber": reservation_number, "retrieveBooking": "true"},
+            timeout=10,
+            allow_redirects=True,
+        )
+        body = r.text
+        low  = body.lower()
+        result["raw"] = r.status_code
+
+        if any(k in low for k in ERROR_KW):
+            result["valid"] = False
+            return result
+
+        if any(k in low for k in SUCCESS_KW):
+            result["valid"] = True
+            soup = BeautifulSoup(body, "html.parser")
+            # titre film
+            for cls in ["filmTitle","film-title","movie-title","title"]:
+                el = soup.find(class_=re.compile(cls, re.I))
+                if el:
+                    result["film"] = el.get_text(strip=True)[:80]
+                    break
+            # date séance
+            for cls in ["date","seance","session","showtime"]:
+                el = soup.find(class_=re.compile(cls, re.I))
+                if el:
+                    result["date"] = el.get_text(strip=True)[:60]
+                    break
+            # cinéma
+            for cls in ["cinema","theater","venue"]:
+                el = soup.find(class_=re.compile(cls, re.I))
+                if el:
+                    result["cinema"] = el.get_text(strip=True)[:80]
+                    break
+            # nombre de places
+            seats = soup.find(class_=re.compile(r"place|seat|ticket", re.I))
+            if seats:
+                result["seats"] = seats.get_text(strip=True)[:50]
+            # fallback: titre de page
+            if not result["film"]:
+                title = soup.find("title")
+                if title:
+                    result["film"] = title.get_text(strip=True)[:80]
+            return result
+
+        # réponse ambiguë — on log les premiers textes
+        soup = BeautifulSoup(body, "html.parser")
+        texts = [t.strip() for t in soup.stripped_strings if len(t.strip()) > 15][:6]
+        result["valid"] = None
+        result["raw"]   = f"HTTP {r.status_code} — " + " | ".join(texts)
+        return result
+
+    except Exception as e:
+        result["valid"] = None
+        result["raw"]   = str(e)
+        return result
+
 def crtsh_subdomains(domain: str):
     r = safe_get(f"https://crt.sh/?q=%.{domain}&output=json")
     if r and r.status_code == 200:
@@ -229,6 +312,7 @@ async def on_message(msg: discord.Message):
             "`!domain <domain>` — DNS, subdomains, Shodan\n"
             "`!ip <ip>` — IP geolocation + Shodan + open ports\n"
             "`!user <username>` — check 10 platforms\n"
+            "`!check ugc <numero>` — vérifie si une réservation UGC est valide\n"
             "`!stats` — breach DB statistics\n"
         )
 
@@ -378,6 +462,37 @@ async def on_message(msg: discord.Message):
             out.append(f"🔴 **CVEs ({len(sho['vulns'])}):** {', '.join(sho['vulns'][:6])}")
 
         await msg.channel.send("\n".join(out))
+
+    # ── !check ugc <reservation_number> ─────────────────────────────────────
+    elif cmd == "check":
+        parts2 = args.lower().split(None, 1)
+        if not parts2 or parts2[0] != "ugc":
+            await msg.channel.send("Usage: `!check ugc <reservation_number>`\nEx: `!check ugc 33500063B071466134`")
+            return
+        if len(parts2) < 2:
+            await msg.channel.send("Usage: `!check ugc <reservation_number>`")
+            return
+        raw_num = parts2[1].strip().upper()
+        await msg.channel.send(f"🎟️ Checking UGC reservation `{raw_num}`...")
+
+        res = check_ugc_reservation(raw_num)
+
+        if res["valid"] is True:
+            lines = [f"✅ **VALID** — `{raw_num}`"]
+            if res["film"]:   lines.append(f"🎬 **Film:** {res['film']}")
+            if res["date"]:   lines.append(f"📅 **Séance:** {res['date']}")
+            if res["cinema"]: lines.append(f"📍 **Cinéma:** {res['cinema']}")
+            if res["seats"]:  lines.append(f"💺 **Places:** {res['seats']}")
+            await msg.channel.send("\n".join(lines))
+
+        elif res["valid"] is False:
+            await msg.channel.send(f"❌ **INVALID** — réservation `{raw_num}` non trouvée sur UGC")
+
+        else:
+            await msg.channel.send(
+                f"❓ **Inconnu** — réponse ambiguë (HTTP {res['raw']})\n"
+                f"UGC a peut-être changé son interface — vérifie manuellement sur ugc.fr"
+            )
 
     # ── !user <username> ────────────────────────────────────────────────────
     elif cmd == "user":
