@@ -141,39 +141,56 @@ def shodan_internetdb(ip: str):
         return r.json()
     return {}
 
+def _build_ugc_session():
+    try:
+        import cloudscraper
+        s = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows","mobile":False})
+    except ImportError:
+        s = requests.Session()
+        s.verify = False
+    s.headers.update({
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Referer":         "https://www.ugc.fr/",
+        "Origin":          "https://www.ugc.fr",
+    })
+    return s
+
+def _parse_csrf(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    for name in ["_csrf","csrfToken","csrf_token","token","_token"]:
+        el = soup.find("input", {"name": name})
+        if el:
+            return name, el.get("value","")
+    for el in soup.find_all("input", {"type":"hidden"}):
+        nm = el.get("name","")
+        if "token" in nm.lower():
+            return nm, el.get("value","")
+    return None, None
+
 def check_ugc_reservation(reservation_number: str) -> dict:
-    """
-    Vérifie si une réservation UGC est valide en tapant sur le portail web.
-    Retourne un dict: {valid, film, date, cinema, seats, raw_status}
-    """
+    """Vérifie si une réservation UGC est valide. Retourne {valid, film, date, cinema, seats, raw}"""
     reservation_number = reservation_number.strip().upper()
     result = {"valid": None, "film": None, "date": None, "cinema": None, "seats": None, "raw": ""}
 
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-        "Referer":         "https://www.ugc.fr/",
-    })
-    sess.verify = False
-
+    UGC_URL   = "https://www.ugc.fr/reservation/retrieveBooking.html"
     ERROR_KW  = ["introuvable","invalid","not found","aucune","incorrect","erreur"]
-    SUCCESS_KW = ["séance","cinema","film","salle","places","montant","votre réservation","reservation"]
+    SUCCESS_KW = ["séance","votre billet","votre réservation","film","salle","places","montant"]
 
     try:
-        # seed session cookies
-        sess.get("https://www.ugc.fr/reservation/retrieveBooking.html", timeout=10)
-        # POST form
-        r = sess.post(
-            "https://www.ugc.fr/reservation/retrieveBooking.html",
-            data={"bookingNumber": reservation_number, "retrieveBooking": "true"},
-            timeout=10,
-            allow_redirects=True,
-        )
+        sess = _build_ugc_session()
+        # seed cookies + récupère CSRF token
+        r1 = sess.get(UGC_URL, timeout=12)
+        csrf_name, csrf_val = _parse_csrf(r1.text)
+
+        payload = {"bookingNumber": reservation_number, "retrieveBooking": "true"}
+        if csrf_name and csrf_val:
+            payload[csrf_name] = csrf_val
+
+        r = sess.post(UGC_URL, data=payload, timeout=12, allow_redirects=True)
+        result["raw"] = r.status_code
         body = r.text
         low  = body.lower()
-        result["raw"] = r.status_code
 
         if any(k in low for k in ERROR_KW):
             result["valid"] = False
@@ -182,45 +199,28 @@ def check_ugc_reservation(reservation_number: str) -> dict:
         if any(k in low for k in SUCCESS_KW):
             result["valid"] = True
             soup = BeautifulSoup(body, "html.parser")
-            # titre film
-            for cls in ["filmTitle","film-title","movie-title","title"]:
-                el = soup.find(class_=re.compile(cls, re.I))
+            for cls_pat, key in [
+                (r"film|movie|title",         "film"),
+                (r"date|seance|session",       "date"),
+                (r"cinema|theater|venue|lieu", "cinema"),
+                (r"place|seat|ticket",         "seats"),
+            ]:
+                el = soup.find(class_=re.compile(cls_pat, re.I))
                 if el:
-                    result["film"] = el.get_text(strip=True)[:80]
-                    break
-            # date séance
-            for cls in ["date","seance","session","showtime"]:
-                el = soup.find(class_=re.compile(cls, re.I))
-                if el:
-                    result["date"] = el.get_text(strip=True)[:60]
-                    break
-            # cinéma
-            for cls in ["cinema","theater","venue"]:
-                el = soup.find(class_=re.compile(cls, re.I))
-                if el:
-                    result["cinema"] = el.get_text(strip=True)[:80]
-                    break
-            # nombre de places
-            seats = soup.find(class_=re.compile(r"place|seat|ticket", re.I))
-            if seats:
-                result["seats"] = seats.get_text(strip=True)[:50]
-            # fallback: titre de page
+                    result[key] = el.get_text(strip=True)[:80]
             if not result["film"]:
-                title = soup.find("title")
-                if title:
-                    result["film"] = title.get_text(strip=True)[:80]
+                t = soup.find("title")
+                if t:
+                    result["film"] = t.get_text(strip=True)[:80]
             return result
 
-        # réponse ambiguë — on log les premiers textes
-        soup = BeautifulSoup(body, "html.parser")
-        texts = [t.strip() for t in soup.stripped_strings if len(t.strip()) > 15][:6]
-        result["valid"] = None
-        result["raw"]   = f"HTTP {r.status_code} — " + " | ".join(texts)
+        soup  = BeautifulSoup(body, "html.parser")
+        texts = [t.strip() for t in soup.stripped_strings if len(t.strip()) > 15][:5]
+        result["raw"] = f"HTTP {r.status_code} — " + " | ".join(texts)
         return result
 
     except Exception as e:
-        result["valid"] = None
-        result["raw"]   = str(e)
+        result["raw"] = str(e)
         return result
 
 def crtsh_subdomains(domain: str):
