@@ -41,14 +41,19 @@ PAGE_URL = "https://www.ugc.fr/les-offres-ugc.html"
 # Candidats probables:
 FORM_CANDIDATES = [
     "https://www.ugc.fr/les-offres-ugc.html",
-    "https://www.ugc.fr/carte/solde",
-    "https://www.ugc.fr/carte/check",
-    "https://www.ugc.fr/api/carte/solde",
-    "https://www.ugc.fr/cartes/solde",
 ]
 
-SUCCESS_KW = ["solde","places","€","crédit","validité","expire","illimité","votre carte","points"]
-ERROR_KW   = ["introuvable","invalide","incorrect","not found","erreur","numéro incorrect"]
+# confirmé par inspection réseau
+ACTION_URL  = "https://www.ugc.fr/offresCartesAction/valider.action"
+CARD_FIELD  = "cardNumber"
+HIDDEN_BASE = {"page": "30013", "type": "ugc"}
+
+# confirmé en live: réponse page pour carte invalide
+ERROR_KW   = ["le type de carte est inconnu", "type de carte est inconnu",
+               "introuvable","invalide","incorrect","numéro incorrect","carte inconnue"]
+# carte valide → UGC affiche le solde (montant €, ou nb places)
+SUCCESS_KW = ["votre solde","solde :", "places restantes","votre carte est valide",
+               "crédit disponible","valable jusqu"]
 
 def parse_form(html: str):
     """Trouve l'action du form + champs cachés (CSRF etc)."""
@@ -77,22 +82,13 @@ def parse_form(html: str):
     return PAGE_URL, {}, "numeroCarte"
 
 def probe_endpoint(sess):
-    """Inspecte la page pour trouver l'action du form."""
-    print("[*] Inspecting UGC card page...")
+    """Retourne l'endpoint confirmé par inspection réseau."""
+    print(f"[*] Endpoint: {ACTION_URL}  field={CARD_FIELD}")
     try:
-        r = sess.get(PAGE_URL, timeout=12)
-        print(f"  [GET] {PAGE_URL} → {r.status_code}")
-        if r.status_code == 200:
-            action, hidden, card_field = parse_form(r.text)
-            print(f"  [FORM] action={action}")
-            print(f"  [FORM] card_field={card_field}")
-            if hidden:
-                for k,v in hidden.items():
-                    print(f"  [HIDDEN] {k}={v[:20]}...")
-            return action, hidden, card_field, r.text
-    except Exception as e:
-        print(f"  [!] {e}")
-    return PAGE_URL, {}, "numeroCarte", ""
+        sess.get(PAGE_URL, timeout=10)  # seed cookies
+    except Exception:
+        pass
+    return ACTION_URL, dict(HIDDEN_BASE), CARD_FIELD, ""
 
 def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> dict:
     num = str(num).strip()
