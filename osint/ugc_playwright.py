@@ -71,65 +71,96 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
 
         try:
             # ── charge la page ──────────────────────────────────────────────────
-            page.goto(PAGE_URL, wait_until="networkidle", timeout=timeout_ms)
+            print(f"  [1] GET {PAGE_URL}...")
+            page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(2000)  # JS rendering
+
+            # screenshot debug
+            page.screenshot(path="ugc_debug_1_loaded.png")
+            print(f"  [1] screenshot → ugc_debug_1_loaded.png")
+
+            # scroll vers le bas pour déclencher le lazy-load du form
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            page.wait_for_timeout(1500)
 
             # ── cherche le champ carte ──────────────────────────────────────────
-            # UGC form: <input name="cardNumber" type="text">
+            print(f"  [2] Cherche le champ carte...")
             field = None
             for selector in [
                 'input[name="cardNumber"]',
                 'input[name="numeroCarte"]',
+                '#SoldeCarte input[type="text"]',
+                'form[action*="valider"] input[type="text"]',
+                'form[action*="CarteAction"] input[type="text"]',
                 'input[type="text"][name*="card" i]',
                 'input[type="text"][name*="carte" i]',
                 'input[type="text"][name*="numero" i]',
-                '#SoldeCarte input[type="text"]',
-                'form[name="valider"] input[type="text"]',
                 '.form-inline input[type="text"]',
             ]:
                 try:
-                    el = page.wait_for_selector(selector, timeout=3000)
+                    el = page.wait_for_selector(selector, timeout=2000, state="visible")
                     if el:
                         field = selector
+                        print(f"  [2] ✓ Field trouvé: {selector}")
                         break
                 except Exception:
                     pass
 
             if not field:
-                # fallback: prend le premier input text du form carte
-                page.wait_for_selector("form", timeout=5000)
-                field = 'input[type="text"]'
+                page.screenshot(path="ugc_debug_2_nofield.png")
+                print(f"  [2] ✗ Aucun champ trouvé → ugc_debug_2_nofield.png")
+                # liste tous les inputs visibles pour debug
+                inputs = page.evaluate("""
+                    Array.from(document.querySelectorAll('input')).map(i => ({
+                        name: i.name, type: i.type, id: i.id,
+                        visible: i.offsetParent !== null
+                    }))
+                """)
+                print(f"  [2] Inputs sur la page: {inputs}")
+                return {"num": num, "status": "ERR_no_field", "detail": str(inputs)}
+
+            # scroll vers le champ
+            page.locator(field).scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
 
             # ── remplit le numéro ───────────────────────────────────────────────
-            page.fill(field, num)
-            time.sleep(random.uniform(0.3, 0.8))  # comportement humain
+            page.fill(field, "")
+            page.type(field, num, delay=50)  # frappe lettre par lettre
+            time.sleep(random.uniform(0.3, 0.7))
+            page.screenshot(path="ugc_debug_3_filled.png")
+            print(f"  [3] Rempli '{num}' → ugc_debug_3_filled.png")
 
             # ── submit ──────────────────────────────────────────────────────────
-            # trouve le bouton submit dans le même form
             submitted = False
             for btn_sel in [
+                'form[action*="valider"] input[type="submit"]',
+                'form[action*="CarteAction"] button',
+                '#SoldeCarte input[type="submit"]',
+                '#SoldeCarte button',
                 'input[type="submit"]',
                 'button[type="submit"]',
                 'button:has-text("Vérifier")',
                 'button:has-text("Valider")',
                 'button:has-text("OK")',
-                '.btn-submit',
             ]:
                 try:
                     btn = page.query_selector(btn_sel)
                     if btn and btn.is_visible():
                         btn.click()
                         submitted = True
+                        print(f"  [4] Click submit: {btn_sel}")
                         break
                 except Exception:
                     pass
 
             if not submitted:
-                # fallback: presse Enter sur le field
                 page.press(field, "Enter")
+                print(f"  [4] Fallback: Enter")
 
             # ── attend la réponse ───────────────────────────────────────────────
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-            time.sleep(0.5)
+            page.wait_for_timeout(3000)
+            page.screenshot(path="ugc_debug_4_result.png")
+            print(f"  [5] Résultat → ugc_debug_4_result.png")
 
             content = page.content()
             low     = content.lower()
@@ -147,7 +178,13 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
                         break
                 return {"num": num, "status": "VALID", "balance": balance}
 
-            return {"num": num, "status": "AMBIG", "detail": content[1000:1200]}
+            # dump 500 chars autour des keywords potentiels pour debug
+            snippet = ""
+            for kw in ["solde","carte","valide","erreur","inconnu","demande"]:
+                idx = low.find(kw)
+                if idx > 0:
+                    snippet += f"[{kw}]→" + content[max(0,idx-50):idx+150] + "\n"
+            return {"num": num, "status": "AMBIG", "detail": snippet or content[800:1100]}
 
         except Exception as e:
             return {"num": num, "status": f"ERR_{str(e)[:60]}"}
