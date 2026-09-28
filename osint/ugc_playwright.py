@@ -22,7 +22,7 @@ SESSION_KW = ["une demande a déjà été envoyée","momentanément indisponible
 SUCCESS_KW = ["votre solde","solde :","places restantes","carte est valide",
                "crédit disponible","valable jusqu"]
 
-def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
+def check_card_playwright(num: str, headless=True, timeout_ms=20000, verbose=False) -> dict:
     """
     Ouvre un contexte Chrome isolé, remplit le form carte, lit la réponse.
     Chaque appel = session totalement fraîche (new cookies, new fingerprint).
@@ -75,16 +75,16 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
             page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(2000)  # JS rendering
 
-            # screenshot debug
-            page.screenshot(path="ugc_debug_1_loaded.png")
-            print(f"  [1] screenshot → ugc_debug_1_loaded.png")
+            if verbose:
+                page.screenshot(path="ugc_debug_1_loaded.png")
+                print(f"  [1] screenshot → ugc_debug_1_loaded.png")
 
             # scroll vers le bas pour déclencher le lazy-load du form
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
             page.wait_for_timeout(1500)
 
             # ── cherche le champ carte ──────────────────────────────────────────
-            print(f"  [2] Cherche le champ carte...")
+            if verbose: print(f"  [2] Cherche le champ carte...")
             field = None
             for selector in [
                 'input[name="cardNumber"]',
@@ -101,23 +101,22 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
                     el = page.wait_for_selector(selector, timeout=2000, state="visible")
                     if el:
                         field = selector
-                        print(f"  [2] ✓ Field trouvé: {selector}")
+                        if verbose: print(f"  [2] ✓ Field trouvé: {selector}")
                         break
                 except Exception:
                     pass
 
             if not field:
-                page.screenshot(path="ugc_debug_2_nofield.png")
-                print(f"  [2] ✗ Aucun champ trouvé → ugc_debug_2_nofield.png")
-                # liste tous les inputs visibles pour debug
-                inputs = page.evaluate("""
-                    Array.from(document.querySelectorAll('input')).map(i => ({
-                        name: i.name, type: i.type, id: i.id,
-                        visible: i.offsetParent !== null
-                    }))
-                """)
-                print(f"  [2] Inputs sur la page: {inputs}")
-                return {"num": num, "status": "ERR_no_field", "detail": str(inputs)}
+                if verbose:
+                    page.screenshot(path="ugc_debug_2_nofield.png")
+                    inputs = page.evaluate("""
+                        Array.from(document.querySelectorAll('input')).map(i => ({
+                            name: i.name, type: i.type, id: i.id,
+                            visible: i.offsetParent !== null
+                        }))
+                    """)
+                    print(f"  [2] ✗ Aucun champ → {inputs}")
+                return {"num": num, "status": "ERR_no_field"}
 
             # scroll vers le champ
             page.locator(field).scroll_into_view_if_needed()
@@ -125,10 +124,11 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
 
             # ── remplit le numéro ───────────────────────────────────────────────
             page.fill(field, "")
-            page.type(field, num, delay=50)  # frappe lettre par lettre
+            page.type(field, num, delay=50)
             time.sleep(random.uniform(0.3, 0.7))
-            page.screenshot(path="ugc_debug_3_filled.png")
-            print(f"  [3] Rempli '{num}' → ugc_debug_3_filled.png")
+            if verbose:
+                page.screenshot(path="ugc_debug_3_filled.png")
+                print(f"  [3] Rempli '{num}' → ugc_debug_3_filled.png")
 
             # ── submit ──────────────────────────────────────────────────────────
             submitted = False
@@ -148,19 +148,19 @@ def check_card_playwright(num: str, headless=True, timeout_ms=20000) -> dict:
                     if btn and btn.is_visible():
                         btn.click()
                         submitted = True
-                        print(f"  [4] Click submit: {btn_sel}")
+                        if verbose: print(f"  [4] Click: {btn_sel}")
                         break
                 except Exception:
                     pass
 
             if not submitted:
                 page.press(field, "Enter")
-                print(f"  [4] Fallback: Enter")
+                if verbose: print(f"  [4] Fallback: Enter")
 
-            # ── attend la réponse ───────────────────────────────────────────────
             page.wait_for_timeout(3000)
-            page.screenshot(path="ugc_debug_4_result.png")
-            print(f"  [5] Résultat → ugc_debug_4_result.png")
+            if verbose:
+                page.screenshot(path="ugc_debug_4_result.png")
+                print(f"  [5] Résultat → ugc_debug_4_result.png")
 
             content = page.content()
             low     = content.lower()
@@ -204,7 +204,7 @@ def worker(work_q: queue.Queue, out_file: str, delay: float, headless: bool):
         except queue.Empty:
             break
 
-        res = check_card_playwright(num, headless=headless)
+        res = check_card_playwright(num, headless=headless, verbose=False)
 
         with LOCK:
             if res["status"] == "SESSION_LIMIT":
@@ -282,7 +282,7 @@ def main():
 
     if args.check:
         print(f"[*] Check {args.check} (headless={headless})")
-        res = check_card_playwright(args.check, headless=headless)
+        res = check_card_playwright(args.check, headless=headless, verbose=True)
         if res["status"] == "VALID":
             print(f"\n✅ VALID — solde: {res.get('balance')}")
         elif res["status"] == "INVALID":
